@@ -7,14 +7,18 @@ import sys
 import os
 import torch
 from transformers import AutoTokenizer
-
+from pathlib import Path
 # 添加src路径
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from dataset_multimodal import MultimodalDataset, DataCollatorForMultimodalDataset
-from model.qwen3_ts import Qwen3TSConfig, Qwen3TSForCausalLM
-from constants import DEFAULT_TS_TOKEN, TS_TOKEN_INDEX
-import constants as GLOBAL_CONSTANTS
+
+current_file = Path(__file__).resolve()
+parent_dir = current_file.parents[1]
+sys.path.insert(0, str(parent_dir))
+
+from src.dataset_multimodal import MultimodalDataset, DataCollatorForMultimodalDataset
+from src.model.qwen3_ts import Qwen3TSConfig, Qwen3TSForCausalLM
+from src.constants import DEFAULT_TS_TOKEN
+import src.constants as GLOBAL_CONSTANTS
 
 
 def test_dataset_loading(data_path, tokenizer, context_window=256):
@@ -38,19 +42,19 @@ def test_dataset_loading(data_path, tokenizer, context_window=256):
         print(f"\n样本 0:")
         print(f"  - input_ids shape: {sample['input_ids'].shape}")
         print(f"  - labels shape: {sample['labels'].shape}")
-        print(f"  - time_series shape: {sample['time_series'].shape}")
-        print(f"  - time_series: [n_vars={sample['time_series'].shape[0]}, seq_len={sample['time_series'].shape[1]}]")
+        print(f"  - time_series shape: {sample['timeseries'].shape}")
+        print(f"  - time_series: [n_vars={sample['timeseries'].shape[0]}, seq_len={sample['timeseries'].shape[1]}]")
         
         # 解码文本
         text = tokenizer.decode(sample['input_ids'], skip_special_tokens=False)
         print(f"\n  文本内容（前200字符）:\n  {text[:200]}...")
         
         # 统计<ts> token数量
-        ts_count = (sample['input_ids'] == TS_TOKEN_INDEX).sum().item()
+        ts_count = (sample['input_ids'] == GLOBAL_CONSTANTS.TS_TOKEN_INDEX).sum().item()
         print(f"\n  <ts> token数量: {ts_count}")
-        print(f"  时序变量数: {sample['time_series'].shape[0]}")
+        print(f"  时序变量数: {sample['timeseries'].shape[0]}")
         
-        if ts_count == sample['time_series'].shape[0]:
+        if ts_count == sample['timeseries'].shape[0]:
             print(f"  ✓ <ts>数量与变量数一致")
         else:
             print(f"  ✗ 警告：<ts>数量与变量数不一致！")
@@ -81,7 +85,7 @@ def test_data_collator(data_path, tokenizer, context_window=256):
         collator = DataCollatorForMultimodalDataset(tokenizer=tokenizer)
         
         # 创建一个batch（2个样本）
-        batch_size = min(2, len(dataset))
+        batch_size = 2
         instances = [dataset[i] for i in range(batch_size)]
         
         batch = collator(instances)
@@ -91,9 +95,9 @@ def test_data_collator(data_path, tokenizer, context_window=256):
         print(f"  - input_ids: {batch['input_ids'].shape}")
         print(f"  - labels: {batch['labels'].shape}")
         print(f"  - attention_mask: {batch['attention_mask'].shape}")
-        print(f"  - time_series: List[Tensor], 长度={len(batch['time_series'])}")
+        print(f"  - time_series: List[Tensor], 长度={len(batch['timeseries'])}")
         
-        for i, ts in enumerate(batch['time_series']):
+        for i, ts in enumerate(batch['timeseries']):
             print(f"    - 样本{i}: {ts.shape}")
         
         return True
@@ -154,7 +158,7 @@ def test_model_forward(data_path, model_path, context_window=256):
             torch_dtype=torch.float16,
         )
         
-        # Resize embedding
+        # 调整词嵌入层
         if num_new_tokens > 0:
             model.resize_token_embeddings(len(tokenizer))
         
@@ -173,13 +177,13 @@ def test_model_forward(data_path, model_path, context_window=256):
         )
         
         collator = DataCollatorForMultimodalDataset(tokenizer=tokenizer)
-        batch = collator([dataset[0]])
+        batch = collator([dataset[0],dataset[1]])
         
         # 移动到设备
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['labels'].to(device)
-        time_series = [ts.to(device) for ts in batch['time_series']]
+        time_series = [ts.to(device) for ts in batch['timeseries']]
         
         print(f"\n执行forward...")
         with torch.no_grad():
@@ -187,7 +191,7 @@ def test_model_forward(data_path, model_path, context_window=256):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
-                time_series=time_series
+                timeseries=time_series
             )
         
         print(f"✓ Forward成功！")
@@ -207,10 +211,10 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="测试多模态数据加载和模型")
-    parser.add_argument("--data_path", type=str, required=True, help="JSONL数据文件路径")
+    parser.add_argument("--data_path", type=str, default='/root/data1/datasets/ChatTS/align_256/train.jsonl', help="JSONL数据文件路径")
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3-8B", help="Qwen3模型路径")
     parser.add_argument("--context_window", type=int, default=256, help="时序窗口长度")
-    parser.add_argument("--test", type=str, default="all", choices=["all", "dataset", "collator", "model"],
+    parser.add_argument("--test", type=str, default="model", choices=["all", "dataset", "collator", "model"],
                        help="测试类型")
     
     args = parser.parse_args()
@@ -236,6 +240,7 @@ def main():
         
         # 添加<ts> token
         num_new_tokens = tokenizer.add_tokens([DEFAULT_TS_TOKEN], special_tokens=True)
+
         GLOBAL_CONSTANTS.TS_TOKEN_INDEX = tokenizer.convert_tokens_to_ids(DEFAULT_TS_TOKEN)
         print(f"✓ Tokenizer加载完成")
         print(f"  添加 {num_new_tokens} 个新token")

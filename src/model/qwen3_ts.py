@@ -14,7 +14,8 @@ from transformers import Qwen3Config, Qwen3Model, Qwen3ForCausalLM
 
 from .ts_encoder import PatchTSTEncoderWrapper, build_ts_encoder
 from .projector import build_projector
-from ..constants import IGNORE_INDEX, TS_TOKEN_INDEX, DEFAULT_TS_TOKEN
+from ..constants import IGNORE_INDEX, DEFAULT_TS_TOKEN
+from .. import constants
 
 
 class Qwen3TSConfig(Qwen3Config):
@@ -31,6 +32,7 @@ class Qwen3TSConfig(Qwen3Config):
         mm_ts_tower: str = "patchtst",
         patchtst_checkpoint: Optional[str] = None,
         freeze_patchtst: bool = True,
+        #patchtst超参
         context_window: int = 256,
         patch_len: int = 16,
         stride: int = 8,
@@ -71,14 +73,13 @@ class Qwen3TSConfig(Qwen3Config):
         
         # 训练
         self.tune_mm_mlp_adapter = tune_mm_mlp_adapter
-        self.pretrain_mm_mlp_adapter = pretrain_mm_mlp_adapter
+        self.pretrain_mm_mlp_adapter = pretrain_mm_mlp_adapter  #预训练投影层权重路径
 
 
 class Qwen3TSModel(Qwen3Model):
     """
-    多模态Qwen3模型（基础模型）
-    
     继承Qwen3Model，添加时序编码器和投影层
+    在Backbone中添加时序编码器和适配器
     """
     config_class = Qwen3TSConfig
     
@@ -158,21 +159,22 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
     3. Qwen3模型: 融合后的embedding -> 文本生成
     
     使用方式:
-    - time_series: List of [n_vars, seq_len]
+    - timeseries: List of [n_vars, seq_len]
     - input_ids: 包含<ts> token作为占位符
     """
     config_class = Qwen3TSConfig
     
     def __init__(self, config: Qwen3TSConfig):
-        # 初始化Qwen3ForCausalLM
+        # 会调用Qwen3ForCausalLM的父类PreTrainedModel.init,从而跳过Qwen3ForCausalLM的init，避免创建模型
+        # TODO: 看一下源码的实现
         super(Qwen3ForCausalLM, self).__init__(config)
         
         # 使用多模态Model
         self.model = Qwen3TSModel(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False) #TODO:能成功加载hf权重吗？
         
-        # 初始化权重
+        # PreTrainedModel提供的hook,负责权重初始化
         self.post_init()
         
         # 加载预训练投影层权重
@@ -211,7 +213,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[List[torch.FloatTensor]],
         labels: Optional[torch.LongTensor],
-        time_series: Optional[List[torch.Tensor]]
+        timeseries: Optional[List[torch.Tensor]]
     ):
         """
         准备多模态输入
@@ -223,7 +225,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
             attention_mask: [batch, seq_len]
             past_key_values: KV cache
             labels: [batch, seq_len]
-            time_series: List of [n_vars, seq_len]，长度为batch_size
+            timeseries: List of [n_vars, seq_len]，长度为batch_size
             
         Returns:
             None, attention_mask, past_key_values, inputs_embeds, labels
@@ -231,9 +233,9 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
         ts_encoder = self.get_ts_encoder()
         
         # 如果没有时序数据或编码器，直接返回
-        if ts_encoder is None or time_series is None or input_ids.shape[1] == 1:
+        if ts_encoder is None or timeseries is None or input_ids.shape[1] == 1:
             if past_key_values is not None and ts_encoder is not None and \
-               time_series is not None and input_ids.shape[1] == 1:
+               timeseries is not None and input_ids.shape[1] == 1:
                 # 生成阶段的attention mask调整
                 attention_mask = torch.ones(
                     (attention_mask.shape[0], past_key_values[-1][-1].shape[-2] + 1),
@@ -243,7 +245,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
             return input_ids, attention_mask, past_key_values, None, labels
         
         # 编码时间序列
-        ts_features_list = self.model.encode_timeseries(time_series)
+        ts_features_list = self.model.encode_timeseries(timeseries)
         # ts_features_list: List of [n_vars * n_patches, hidden_size]
         
         # 构建融合的embedding序列
@@ -255,7 +257,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
             cur_ts_features = ts_features_list[batch_idx]  # [n_vars * n_patches, hidden_size]
             
             # 找到<ts> token的位置
-            ts_token_indices = torch.where(cur_input_ids == TS_TOKEN_INDEX)[0]
+            ts_token_indices = torch.where(cur_input_ids == constants.TS_TOKEN_INDEX)[0]
             num_ts_tokens = len(ts_token_indices)
             
             if num_ts_tokens == 0:
@@ -401,32 +403,32 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
     
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        input_ids: torch.LongTensor = None,     # [batch, ids_length]
+        attention_mask: Optional[torch.Tensor] = None, # [batch, ids_length], padding部分为False TODO:作用？
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None, 
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        time_series: Optional[List[torch.Tensor]] = None,  # 关键参数
+        timeseries: Optional[List[torch.Tensor]] = None,  # 关键参数
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         """
         前向传播
         
         Args:
-            input_ids: [batch, seq_len]
-            attention_mask: [batch, seq_len]
-            position_ids: [batch, seq_len]
-            past_key_values: KV cache
+            input_ids: [batch, seq_len] 
+            attention_mask: [batch, seq_len]    #用来告知模型哪些位置是padding，哪些位置是真实的token
+            position_ids: [batch, seq_len]      #从attention_mask生成，非pad+1，pad+0
+            past_key_values: KV cache           #初次调用
             inputs_embeds: [batch, seq_len, hidden_size]
             labels: [batch, seq_len]
             use_cache: 是否使用KV cache
             output_attentions: 是否输出注意力权重
             output_hidden_states: 是否输出隐藏状态
-            time_series: List of [n_vars, seq_len]，时间序列数据
+            timeseries: List of [n_vars, seq_len]，时间序列数据
             return_dict: 是否返回字典
             
         Returns:
@@ -437,9 +439,10 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
         # 准备多模态输入
+
         input_ids, attention_mask, past_key_values, inputs_embeds, labels = \
             self.prepare_inputs_labels_for_multimodal(
-                input_ids, attention_mask, past_key_values, labels, time_series
+                input_ids, attention_mask, past_key_values, labels, timeseries
             )
         
         # Qwen3 forward
@@ -524,7 +527,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
             "past_key_values": past_key_values,
             "use_cache": kwargs.get("use_cache"),
             "attention_mask": attention_mask,
-            "time_series": kwargs.get("time_series", None),
+            "timeseries": kwargs.get("timeseries", None),
         })
         
         return model_inputs

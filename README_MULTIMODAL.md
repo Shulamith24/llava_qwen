@@ -69,7 +69,7 @@ ls PatchTST_supervised/checkpoints/*/checkpoint.pth
 ```json
 {
   "input": "There are 2 time series. <ts></ts> and <ts></ts>. What patterns do you see?",
-  "time_series": [
+  "timeseries": [
     [1.0, 2.0, 3.0, ..., 256个值],
     [4.0, 5.0, 6.0, ..., 256个值]
   ],

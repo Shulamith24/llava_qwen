@@ -18,7 +18,7 @@ from torch.utils.data import Dataset
 # 导入多模态组件
 from model.qwen3_ts import Qwen3TSConfig, Qwen3TSForCausalLM
 from dataset_multimodal import make_multimodal_data_module
-from constants import DEFAULT_TS_TOKEN, TS_TOKEN_INDEX
+from constants import DEFAULT_TS_TOKEN
 import constants as GLOBAL_CONSTANTS
 
 # 全局rank变量

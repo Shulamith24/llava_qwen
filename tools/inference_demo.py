@@ -176,7 +176,7 @@ def main():
         with open(args.input_file, 'r', encoding='utf-8') as f:
             data = json.loads(f.readline())
             input_text = data["input"]
-            time_series = data["time_series"]
+            time_series = data["timeseries"]
     else:
         # 使用示例数据
         print("\n使用示例数据")

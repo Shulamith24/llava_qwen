@@ -13,8 +13,9 @@ import transformers
 from .constants import IGNORE_INDEX, DEFAULT_TS_TOKEN
 
 
+
 # 正则表达式：匹配<ts></ts>成对标签
-TS_PAIR_PATTERN = re.compile(r'<ts>\s*</ts>', flags=re.S)
+
 # 用于删除空的<think>块（继承自原dataset.py）
 EMPTY_THINK_PATTERN = re.compile(r'<think>\s*</think>\s*', flags=re.S)
 
@@ -22,7 +23,7 @@ EMPTY_THINK_PATTERN = re.compile(r'<think>\s*</think>\s*', flags=re.S)
 def preprocess_multimodal_qwen(
     input_text: str,
     output_text: str,
-    time_series: List[List[float]],
+    timeseries: List[List[float]],
     tokenizer: transformers.PreTrainedTokenizer,
     context_window: int,
     remove_thinking: bool = True
@@ -33,7 +34,7 @@ def preprocess_multimodal_qwen(
     Args:
         input_text: 包含<ts></ts>占位符的用户问题
         output_text: 模型回答
-        time_series: 时间序列数据 [[var1], [var2], ...]
+        timeseries: 时间序列数据 [[var1], [var2], ...]
         tokenizer: Qwen3 tokenizer
         context_window: 时序序列长度（用于验证）
         remove_thinking: 是否移除空的<think>块
@@ -42,15 +43,15 @@ def preprocess_multimodal_qwen(
         dict: {
             "input_ids": tensor,
             "labels": tensor,
-            "time_series": tensor [n_vars, seq_len]
+            "timeseries": tensor [n_vars, seq_len]
         }
     """
-    # 1. 处理文本：将<ts></ts>替换为<ts>
-    input_text = TS_PAIR_PATTERN.sub(DEFAULT_TS_TOKEN, input_text)
+    # 1. 处理文本：将<ts><ts/>替换为<ts>
+    input_text = input_text.replace("<ts><ts/>", DEFAULT_TS_TOKEN)
     
-    # 2. 验证<ts>数量与time_series变量数一致
+    # 2. 验证<ts>数量与timeseries变量数一致
     ts_count = input_text.count(DEFAULT_TS_TOKEN)
-    n_vars = len(time_series)
+    n_vars = len(timeseries)
     if ts_count != n_vars:
         raise ValueError(
             f"文本中<ts>数量({ts_count})与时间序列变量数({n_vars})不匹配\n"
@@ -110,8 +111,8 @@ def preprocess_multimodal_qwen(
     labels[:prefix_len] = IGNORE_INDEX
     
     # 8. 转换时间序列为tensor
-    # time_series: [[var1], [var2], ...] -> [n_vars, seq_len]
-    ts_tensor = torch.tensor(time_series, dtype=torch.float32)
+    # timeseries: [[var1], [var2], ...] -> [n_vars, seq_len]
+    ts_tensor = torch.tensor(timeseries, dtype=torch.float32)
     
     # 验证长度
     if ts_tensor.shape[1] != context_window:
@@ -127,7 +128,7 @@ def preprocess_multimodal_qwen(
     return dict(
         input_ids=input_ids,
         labels=labels,
-        time_series=ts_tensor  # [n_vars, seq_len]
+        timeseries=ts_tensor  # [n_vars, seq_len]
     )
 
 
@@ -138,7 +139,7 @@ class MultimodalDataset(Dataset):
     数据格式（JSONL）：
     {
         "input": "There are 2 time series. <ts></ts> and <ts></ts>. What patterns?",
-        "time_series": [[1.0, 2.0, ...], [3.0, 4.0, ...]],
+        "timeseries": [[1.0, 2.0, ...], [3.0, 4.0, ...]],
         "output": "Both time series show upward trends..."
     }
     """
@@ -161,7 +162,7 @@ class MultimodalDataset(Dataset):
                     try:
                         item = json.loads(line)
                         # 验证必需字段
-                        if 'input' not in item or 'output' not in item or 'time_series' not in item:
+                        if 'input' not in item or 'output' not in item or 'timeseries' not in item:
                             print(f"警告：第{line_idx+1}行缺少必需字段，跳过")
                             continue
                         self.data.append(item)
@@ -171,7 +172,7 @@ class MultimodalDataset(Dataset):
         
         self.tokenizer = tokenizer
         self.model_max_length = model_max_length
-        self.context_window = context_window
+        self.context_window = context_window        #TODO：作用
         self.remove_thinking = remove_thinking
         
         print(f"✓ 加载 {len(self.data)} 条多模态样本（来自 {data_path}）")
@@ -183,14 +184,14 @@ class MultimodalDataset(Dataset):
         return len(self.data)
     
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        sample = self.data[i]
+        sample = self.data[i]   #一个dict,dict['timeseries']是list[list[float]]
         
         try:
             # 预处理
             processed = preprocess_multimodal_qwen(
                 input_text=sample["input"],
                 output_text=sample["output"],
-                time_series=sample["time_series"],
+                timeseries=sample["timeseries"],
                 tokenizer=self.tokenizer,
                 context_window=self.context_window,
                 remove_thinking=self.remove_thinking
@@ -199,7 +200,7 @@ class MultimodalDataset(Dataset):
             return dict(
                 input_ids=processed["input_ids"],
                 labels=processed["labels"],
-                time_series=processed["time_series"]
+                timeseries=processed["timeseries"]
             )
         
         except Exception as e:
@@ -212,7 +213,7 @@ class DataCollatorForMultimodalDataset:
     """
     多模态数据整理器
     
-    处理batch内的padding，特别处理time_series（因为长度可能不同）
+    处理batch内的padding，特别处理timeseries（因为长度可能不同）
     """
     
     def __init__(self, tokenizer: transformers.PreTrainedTokenizer):
@@ -223,19 +224,19 @@ class DataCollatorForMultimodalDataset:
         整理batch
         
         Args:
-            instances: List of dicts, 每个dict包含 {input_ids, labels, time_series}
+            instances: List of dicts, 每个dict包含 {input_ids, labels, timeseries}
             
         Returns:
             batch: {
                 input_ids: [batch, seq_len],
                 labels: [batch, seq_len],
                 attention_mask: [batch, seq_len],
-                time_series: List of [n_vars, seq_len]  # 注意：这里是list而非tensor
+                timeseries: List of [n_vars, seq_len]  # 注意：这里是list而非tensor
             }
         """
         input_ids = [instance["input_ids"] for instance in instances]
         labels = [instance["labels"] for instance in instances]
-        time_series = [instance["time_series"] for instance in instances]
+        timeseries = [instance["timeseries"] for instance in instances]
         
         # Padding文本部分
         input_ids = torch.nn.utils.rnn.pad_sequence(
@@ -253,17 +254,17 @@ class DataCollatorForMultimodalDataset:
         input_ids = input_ids[:, :self.tokenizer.model_max_length]
         labels = labels[:, :self.tokenizer.model_max_length]
         
-        # Attention mask
+        # TODO: attention_mask的构造，作用？
         attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
         
-        # time_series保持为list（因为可能变量数不同）
+        # timeseries保持为list（因为可能变量数不同）
         # 模型forward时会逐个处理
         
         batch = dict(
             input_ids=input_ids,
             labels=labels,
             attention_mask=attention_mask,
-            time_series=time_series  # List of [n_vars, seq_len]
+            timeseries=timeseries  # List of [n_vars, seq_len]
         )
         
         return batch
