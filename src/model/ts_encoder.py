@@ -24,6 +24,11 @@ class PatchTSTEncoderWrapper(nn.Module):
     
     基于官方PatchTST_backbone，提取backbone的特征而非预测输出
     
+    **关键设计**：
+    - TSTiEncoder的backbone（W_P, positional encoding, Transformer）不依赖c_in
+    - 只有RevIN和预测head依赖c_in
+    - 我们跳过这两部分，因此可以使用固定的编码器处理任意n_vars的输入
+    
     提供统一的接口，支持：
     - 预训练权重加载
     - 灵活的冻结/解冻控制
@@ -38,7 +43,6 @@ class PatchTSTEncoderWrapper(nn.Module):
         n_heads: 注意力头数
         d_ff: 前馈网络维度
         dropout: dropout率
-        use_revin: 是否使用RevIN归一化
         **kwargs: 其他PatchTST参数
     """
     
@@ -52,7 +56,6 @@ class PatchTSTEncoderWrapper(nn.Module):
         n_heads: int = 16,
         d_ff: int = 256,
         dropout: float = 0.1,
-        use_revin: bool = False,  # 默认不用RevIN，避免归一化问题
         **kwargs
     ):
         super().__init__()
@@ -66,7 +69,6 @@ class PatchTSTEncoderWrapper(nn.Module):
         self.n_heads = n_heads
         self.d_ff = d_ff
         self.dropout = dropout
-        self.use_revin = use_revin
         
         # 计算patch数量
         self.patch_num = int((context_window - patch_len) / stride + 1)
@@ -75,61 +77,35 @@ class PatchTSTEncoderWrapper(nn.Module):
         self.is_loaded = False
         self.hidden_size = d_model  # 每个patch的特征维度
         
-        # 延迟初始化backbone（因为c_in需要在forward时确定）
-        self.backbone = None
-        self._c_in = None  # 记录当前backbone的变量数
-        
-        # 存储配置用于创建backbone
-        self.backbone_config = {
-            'context_window': context_window,
-            'target_window': 0,  # 我们不需要预测，只需要特征
-            'patch_len': patch_len,
-            'stride': stride,
-            'd_model': d_model,
-            'n_layers': n_layers,
-            'n_heads': n_heads,
-            'd_ff': d_ff,
-            'dropout': dropout,
-            'attn_dropout': dropout,
-            'head_dropout': 0,
-            'individual': False,
-            'revin': use_revin,
-            'affine': True,
-            'subtract_last': False,
-            'pretrain_head': False,
-            'head_type': 'flatten',
+        # 创建backbone（使用c_in=1作为dummy，因为backbone不依赖c_in）
+        # 注意：我们不使用RevIN和预测head，所以c_in的值不重要
+        self.backbone = PatchTST_backbone(
+            c_in=1,  # dummy值，backbone不依赖它
+            context_window=context_window,
+            target_window=0,  # 不需要预测
+            patch_len=patch_len,
+            stride=stride,
+            d_model=d_model,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            d_ff=d_ff,
+            dropout=dropout,
+            attn_dropout=dropout,
+            head_dropout=0,
+            individual=False,
+            revin=False,  # 不使用RevIN
+            affine=False,
+            subtract_last=False,
+            pretrain_head=False,
+            head_type='flatten',
             **kwargs
-        }
-    
-    def _get_or_create_backbone(self, c_in: int):
-        """
-        获取或创建对应变量数的backbone
-        
-        Args:
-            c_in: 变量数
-            
-        Returns:
-            backbone: PatchTST_backbone实例
-        """
-        # 如果backbone不存在或变量数改变，重新创建
-        if self.backbone is None or self._c_in != c_in:
-            self.backbone = PatchTST_backbone(
-                c_in=c_in,
-                **self.backbone_config
-            )
-            self._c_in = c_in
-            
-            # 如果已经加载过权重，需要重新加载
-            if hasattr(self, '_cached_checkpoint') and self._cached_checkpoint is not None:
-                self._load_weights_to_backbone(self._cached_checkpoint)
-        
-        return self.backbone
+        )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         前向传播（单样本）
         
-        提取PatchTST backbone的特征，跳过预测head
+        直接使用backbone的TSTiEncoder，跳过RevIN和head
         
         Args:
             x: [n_vars, seq_len] 单个样本的时间序列
@@ -146,35 +122,23 @@ class PatchTSTEncoderWrapper(nn.Module):
         assert seq_len == self.context_window, \
             f"输入序列长度{seq_len}与context_window{self.context_window}不匹配"
         
-        # 获取或创建backbone
-        backbone = self._get_or_create_backbone(n_vars)
-        
         # 添加batch维度: [1, n_vars, seq_len]
         z = x.unsqueeze(0)
         
-        # === 以下代码复制自官方PatchTST_backbone.forward，但跳过head和denorm ===
+        # === 手动实现patching，然后调用backbone.backbone（跳过RevIN和head）===
         
-        # RevIN normalization
-        if backbone.revin:
-            z = z.permute(0, 2, 1)  # [bs, seq_len, n_vars]
-            z = backbone.revin_layer(z, 'norm')
-            z = z.permute(0, 2, 1)  # [bs, n_vars, seq_len]
-        
-        # Patching
-        if backbone.padding_patch == 'end':
-            z = backbone.padding_patch_layer(z)
-        z = z.unfold(dimension=-1, size=backbone.patch_len, step=backbone.stride)  # [bs, n_vars, patch_num, patch_len]
+        # Patching（直接使用官方实现的逻辑）
+        # 注意：不需要padding_patch，因为我们的context_window是固定的
+        z = z.unfold(dimension=-1, size=self.patch_len, step=self.stride)  # [bs, n_vars, patch_num, patch_len]
         z = z.permute(0, 1, 3, 2)  # [bs, n_vars, patch_len, patch_num]
         
-        # Backbone encoder
-        z = backbone.backbone(z)  # [bs, n_vars, d_model, patch_num]
+        # 调用TSTiEncoder（backbone.backbone）
+        # 输入: [bs, n_vars, patch_len, patch_num]
+        # 输出: [bs, n_vars, d_model, patch_num]
+        z = self.backbone.backbone(z)
         
         # 转换为 [bs, n_vars, patch_num, d_model]
-        z = z.permute(0, 1, 3, 2)  # [bs, n_vars, patch_num, d_model]
-        
-        # 注意：我们跳过了head和denorm，因为：
-        # 1. head是用于预测的，我们只需要特征
-        # 2. denorm用于还原预测值，但特征不需要还原
+        z = z.permute(0, 1, 3, 2)
         
         # 移除batch维度
         z = z.squeeze(0)  # [n_vars, patch_num, d_model]
@@ -195,22 +159,6 @@ class PatchTSTEncoderWrapper(nn.Module):
         print(f"从 {checkpoint_path} 加载PatchTST权重...")
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         
-        # 缓存checkpoint以便后续使用
-        self._cached_checkpoint = checkpoint
-        
-        # 如果已经初始化了backbone，立即加载
-        if self.backbone is not None:
-            self._load_weights_to_backbone(checkpoint)
-        
-        self.is_loaded = True
-    
-    def _load_weights_to_backbone(self, checkpoint):
-        """
-        将权重加载到backbone
-        
-        Args:
-            checkpoint: checkpoint字典
-        """
         # 提取模型权重
         if 'model' in checkpoint:
             state_dict = checkpoint['model']
@@ -219,26 +167,31 @@ class PatchTSTEncoderWrapper(nn.Module):
         else:
             state_dict = checkpoint
         
-        # 加载权重（只加载匹配的层）
+        # 只加载backbone部分的权重（跳过RevIN和head）
         model_dict = self.backbone.state_dict()
-        pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict}
+        pretrained_dict = {}
+        
+        for k, v in state_dict.items():
+            # 只加载backbone相关的权重，跳过revin_layer和head
+            if 'revin_layer' not in k and 'head' not in k:
+                if k in model_dict:
+                    pretrained_dict[k] = v
+        
         model_dict.update(pretrained_dict)
         self.backbone.load_state_dict(model_dict, strict=False)
-        print(f"成功加载 {len(pretrained_dict)}/{len(state_dict)} 个参数")
+        print(f"成功加载 {len(pretrained_dict)}/{len([k for k in state_dict.keys() if 'revin_layer' not in k and 'head' not in k])} 个backbone参数")
+        
+        self.is_loaded = True
     
     @property
     def device(self):
         """获取设备"""
-        if self.backbone is not None:
-            return next(self.backbone.parameters()).device
-        return torch.device('cpu')
+        return next(self.backbone.parameters()).device
     
     @property
     def dtype(self):
         """获取数据类型"""
-        if self.backbone is not None:
-            return next(self.backbone.parameters()).dtype
-        return torch.float32
+        return next(self.backbone.parameters()).dtype
     
     @property
     def dummy_feature(self):
