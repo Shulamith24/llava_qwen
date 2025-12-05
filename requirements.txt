@@ -1,0 +1,31 @@
+# Qwen3 LoRA 微调环境依赖（对齐 LLaVA）
+
+# 核心框架
+torch>=2.0.0
+transformers>=4.37.0
+tokenizers>=0.15.0
+
+# 分布式训练
+deepspeed>=0.12.0
+accelerate>=0.25.0
+
+# 参数高效微调
+peft>=0.7.0
+bitsandbytes>=0.41.0
+
+# 数据处理
+datasets>=2.14.0
+sentencepiece>=0.1.99
+
+# 日志和监控
+tensorboard>=2.14.0
+wandb>=0.15.0
+
+# 工具库
+numpy>=1.24.0
+pandas>=2.0.0
+tqdm>=4.65.0
+einops>=0.7.0
+
+# 可选：模型推理加速
+# flash-attn>=2.3.0  # 需要 CUDA 和编译环境
