@@ -12,9 +12,6 @@ warnings.filterwarnings('ignore')
 
 
 class Dataset_ETT_hour(Dataset):
-    """
-    两个方法：read_data从csv文件中读取，
-    """
     def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
                  target='OT', scale=True, timeenc=0, freq='h'):
@@ -44,7 +41,7 @@ class Dataset_ETT_hour(Dataset):
         self.__read_data__()
 
     def __read_data__(self):
-        self.scaler = StandardScaler()      # 标准化
+        self.scaler = StandardScaler()
         df_raw = pd.read_csv(os.path.join(self.root_path,
                                           self.data_path))
 

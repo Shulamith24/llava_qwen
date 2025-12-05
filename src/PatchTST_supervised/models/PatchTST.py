@@ -20,17 +20,14 @@ class Model(nn.Module):
         super().__init__()
         
         # load parameters
-        c_in = configs.enc_in       #n_vars
-        context_window = configs.seq_len        #seq_len
-        target_window = configs.pred_len        #pred_len
+        c_in = configs.enc_in
+        context_window = configs.seq_len
+        target_window = configs.pred_len
         
-        #transformer_block
-        n_layers = configs.e_layers         #encoder层数
-        n_heads = configs.n_heads           #多头注意力
-        d_model = configs.d_model           #transformer的d_model
-        d_ff = configs.d_ff                 #线性层的放缩维度
-        
-        #不同层的dropout率
+        n_layers = configs.e_layers
+        n_heads = configs.n_heads
+        d_model = configs.d_model
+        d_ff = configs.d_ff
         dropout = configs.dropout
         fc_dropout = configs.fc_dropout
         head_dropout = configs.head_dropout
@@ -45,7 +42,6 @@ class Model(nn.Module):
         affine = configs.affine
         subtract_last = configs.subtract_last
         
-        #是否使用时间序列分解
         decomposition = configs.decomposition
         kernel_size = configs.kernel_size
         
