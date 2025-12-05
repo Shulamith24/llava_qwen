@@ -124,6 +124,10 @@ class Qwen3TSModel(Qwen3Model):
             
         Returns:
             features_list: List of [n_vars * n_patches, hidden_size]
+            
+        Note:
+            Flatten顺序: [var0的所有patches, var1的所有patches, ...]
+            这样第i个<ts> token可以直接对应var_i的特征
         """
         ts_encoder = self.get_ts_encoder()
         if ts_encoder is None:
@@ -135,7 +139,9 @@ class Qwen3TSModel(Qwen3Model):
             # 编码为 [n_vars, n_patches, d_model]
             ts_features = ts_encoder(ts)
             
-            # Flatten: [n_vars * n_patches, d_model]
+            # Flatten按变量顺序: [n_vars * n_patches, d_model]
+            # 顺序: [var0_patch0, ..., var0_patchN, var1_patch0, ..., var1_patchN, ...]
+            # 这样第i个<ts>对应的特征就是 [i*n_patches : (i+1)*n_patches]
             n_vars, n_patches, d_model = ts_features.shape
             ts_features = ts_features.reshape(n_vars * n_patches, d_model)
             
@@ -272,10 +278,17 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
                 continue
             
             # 计算每个<ts>对应的特征数量
-            # cur_ts_features总长度 = n_vars * n_patches
-            # 我们需要将其均分给每个<ts> token
+            # cur_ts_features: [n_vars * n_patches, hidden_size]
+            # 每个<ts>对应一个变量的所有patches
             total_ts_length = cur_ts_features.shape[0]
             tokens_per_ts = total_ts_length // num_ts_tokens
+            
+            # 验证：确保能整除
+            if total_ts_length % num_ts_tokens != 0:
+                raise ValueError(
+                    f"时序特征总长度({total_ts_length})无法被<ts>数量({num_ts_tokens})整除！"
+                    f"这可能意味着编码器输出的特征数量与预期不符。"
+                )
             
             # 构建新的embedding序列
             cur_new_input_embeds = []
@@ -285,6 +298,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
                 assert cur_labels.shape == cur_input_ids.shape
             
             # 逐个处理<ts> token
+            # 第i个<ts>对应第i个变量的所有patch特征
             last_idx = 0
             for ts_idx, ts_token_pos in enumerate(ts_token_indices):
                 # <ts>之前的文本embedding
@@ -295,10 +309,11 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
                     if labels is not None:
                         cur_new_labels.append(cur_labels[last_idx:ts_token_pos])
                 
-                # 替换<ts>为时序特征
+                # 替换<ts>为对应变量的时序特征
+                # 第ts_idx个<ts> -> 第ts_idx个变量的n_patches个特征
                 start_idx = ts_idx * tokens_per_ts
                 end_idx = (ts_idx + 1) * tokens_per_ts
-                ts_feature_chunk = cur_ts_features[start_idx:end_idx]  # [tokens_per_ts, hidden_size]
+                ts_feature_chunk = cur_ts_features[start_idx:end_idx]  # [n_patches, hidden_size]
                 cur_new_input_embeds.append(ts_feature_chunk)
                 
                 # 时序token位置的label设为IGNORE_INDEX
