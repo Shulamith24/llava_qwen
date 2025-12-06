@@ -110,20 +110,20 @@ class Qwen3TSModel(Qwen3Model):
     
     def get_ts_encoder(self):
         """获取时序编码器"""
-        ts_encoder = getattr(self, 'ts_encoder', None)
-        if isinstance(ts_encoder, list):
-            ts_encoder = ts_encoder[0]
-        return ts_encoder
+        return getattr(self, 'ts_encoder', None)
     
-    def encode_timeseries(self, time_series_list: List[torch.Tensor]) -> List[torch.Tensor]:
+    def encode_timeseries(self, time_series_list: List[torch.Tensor]) -> List[List[torch.Tensor]]:
         """
         编码时间序列（批量，逐样本处理）
+        
+        保持变量维度的结构化组织，每个变量的patches独立投影
         
         Args:
             time_series_list: List of [n_vars, seq_len]
             
         Returns:
-            features_list: List of [n_vars * n_patches, hidden_size]
+            features_list: List of (List of [n_patches, hidden_size])
+                          外层List长度为batch_size，内层List长度为n_vars
         """
         ts_encoder = self.get_ts_encoder()
         if ts_encoder is None:
@@ -132,17 +132,25 @@ class Qwen3TSModel(Qwen3Model):
         features_list = []
         for ts in time_series_list:
             # ts: [n_vars, seq_len]
+            # 将输入移动到与编码器相同的device和dtype，避免dtype冲突
+            ts = ts.to(device=ts_encoder.device, dtype=ts_encoder.dtype)
             # 编码为 [n_vars, n_patches, d_model]
             ts_features = ts_encoder(ts)
             
-            # Flatten: [n_vars * n_patches, d_model]
             n_vars, n_patches, d_model = ts_features.shape
-            ts_features = ts_features.reshape(n_vars * n_patches, d_model)
             
-            # 投影到Qwen3空间: [n_vars * n_patches, hidden_size]
-            projected = self.mm_projector(ts_features)
+            # 逐变量投影，保持变量边界
+            var_features = []
+            for var_idx in range(n_vars):
+                # 获取第var_idx个变量的所有patches: [n_patches, d_model]
+                var_patches = ts_features[var_idx]
+                
+                # 投影到Qwen3空间: [n_patches, hidden_size]
+                projected = self.mm_projector(var_patches)
+                var_features.append(projected)
             
-            features_list.append(projected)
+            # var_features: List of [n_patches, hidden_size]，长度为n_vars
+            features_list.append(var_features)
         
         return features_list
 
@@ -246,15 +254,17 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
         
         # 编码时间序列
         ts_features_list = self.model.encode_timeseries(timeseries)
-        # ts_features_list: List of [n_vars * n_patches, hidden_size]
+        # ts_features_list: List of (List of [n_patches, hidden_size])
+        #                   外层List长度为batch_size，内层List长度为n_vars
         
         # 构建融合的embedding序列
         new_input_embeds = []
         new_labels = [] if labels is not None else None
         
         for batch_idx, cur_input_ids in enumerate(input_ids):
-            # 当前样本的时序特征
-            cur_ts_features = ts_features_list[batch_idx]  # [n_vars * n_patches, hidden_size]
+            # 当前样本的时序特征: List of [n_patches, hidden_size]，长度为n_vars
+            cur_ts_var_features = ts_features_list[batch_idx]
+            n_vars = len(cur_ts_var_features)
             
             # 找到<ts> token的位置
             ts_token_indices = torch.where(cur_input_ids == constants.TS_TOKEN_INDEX)[0]
@@ -271,11 +281,9 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
                     new_labels.append(labels[batch_idx])
                 continue
             
-            # 计算每个<ts>对应的特征数量
-            # cur_ts_features总长度 = n_vars * n_patches
-            # 我们需要将其均分给每个<ts> token
-            total_ts_length = cur_ts_features.shape[0]
-            tokens_per_ts = total_ts_length // num_ts_tokens
+            # 验证<ts> token数量与变量数一致
+            assert num_ts_tokens == n_vars, \
+                f"样本{batch_idx}: <ts> token数量({num_ts_tokens})必须等于变量数({n_vars})"
             
             # 构建新的embedding序列
             cur_new_input_embeds = []
@@ -295,10 +303,9 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
                     if labels is not None:
                         cur_new_labels.append(cur_labels[last_idx:ts_token_pos])
                 
-                # 替换<ts>为时序特征
-                start_idx = ts_idx * tokens_per_ts
-                end_idx = (ts_idx + 1) * tokens_per_ts
-                ts_feature_chunk = cur_ts_features[start_idx:end_idx]  # [tokens_per_ts, hidden_size]
+                # 第ts_idx个<ts> token对应第ts_idx个变量的所有patches
+                # ts_feature_chunk: [n_patches, hidden_size]
+                ts_feature_chunk = cur_ts_var_features[ts_idx]
                 cur_new_input_embeds.append(ts_feature_chunk)
                 
                 # 时序token位置的label设为IGNORE_INDEX
@@ -331,9 +338,11 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
                 new_labels.append(cur_new_labels)
         
         # 对齐长度（padding）
-        if any(x.shape != new_input_embeds[0].shape for x in new_input_embeds):
-            max_len = max(x.shape[0] for x in new_input_embeds)
-            
+        # 首先保存每个样本的真实序列长度（padding前）
+        actual_lengths = [x.shape[0] for x in new_input_embeds]
+        max_len = max(actual_lengths)
+        
+        if any(length != max_len for length in actual_lengths):
             # Padding embeddings
             new_input_embeds_aligned = []
             for cur_embed in new_input_embeds:
@@ -368,18 +377,15 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
                     new_labels_aligned.append(cur_label)
                 new_labels = torch.stack(new_labels_aligned, dim=0)
             
-            # 更新attention mask
+            # 构建正确的attention_mask
+            # 真实token位置为1，padding位置为0
             if attention_mask is not None:
                 new_attention_mask = []
-                for cur_attn, cur_label in zip(attention_mask, new_labels):
-                    # 新增的部分设为True，padding部分设为False
-                    pad_left = cur_label.shape[0] - labels.shape[1]
-                    pad_right = max_len - cur_label.shape[0]
-                    
+                for actual_len in actual_lengths:
+                    # 真实序列长度为actual_len，其余为padding
                     new_attn = torch.cat([
-                        torch.ones(pad_left, dtype=cur_attn.dtype, device=cur_attn.device),
-                        cur_attn,
-                        torch.zeros(pad_right, dtype=cur_attn.dtype, device=cur_attn.device)
+                        torch.ones(actual_len, dtype=attention_mask.dtype, device=attention_mask.device),
+                        torch.zeros(max_len - actual_len, dtype=attention_mask.dtype, device=attention_mask.device)
                     ], dim=0)
                     new_attention_mask.append(new_attn)
                 attention_mask = torch.stack(new_attention_mask, dim=0)
@@ -388,16 +394,13 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
             if labels is not None:
                 new_labels = torch.stack(new_labels, dim=0)
             
+            # 所有样本长度一致，构建全1的attention_mask
             if attention_mask is not None:
-                pad_left = new_input_embeds.shape[1] - input_ids.shape[1]
-                attention_mask = torch.cat([
-                    torch.ones(
-                        (attention_mask.shape[0], pad_left),
-                        dtype=attention_mask.dtype,
-                        device=attention_mask.device
-                    ),
-                    attention_mask
-                ], dim=1)
+                attention_mask = torch.ones(
+                    (new_input_embeds.shape[0], new_input_embeds.shape[1]),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device
+                )
         
         return None, attention_mask, past_key_values, new_input_embeds, new_labels
     
