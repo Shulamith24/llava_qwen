@@ -10,7 +10,11 @@ from typing import Dict, List, Optional
 from torch.utils.data import Dataset
 import transformers
 
-from .constants import IGNORE_INDEX, DEFAULT_TS_TOKEN
+# 兼容两种导入方式：作为包导入 vs 直接运行脚本
+try:
+    from .constants import IGNORE_INDEX, DEFAULT_TS_TOKEN
+except ImportError:
+    from constants import IGNORE_INDEX, DEFAULT_TS_TOKEN
 
 
 def normalize_timeseries(ts_tensor: torch.Tensor, eps: float = 1e-5):
