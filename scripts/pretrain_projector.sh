@@ -8,7 +8,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3  # 根据GPU数量调整
 
 # 训练参数
 MODEL_PATH="Qwen/Qwen3-8B"  # Qwen3模型路径
-DATA_PATH="data/pretrain.jsonl"  # 预训练数据路径
+DATA_PATH="/root/data1/datasets/ChatTS/align_256/train.jsonl"  # 预训练数据路径
 OUTPUT_DIR="outputs/pretrain_projector"  # 输出目录
 PATCHTST_CKPT=None # PatchTST权重
 
@@ -20,13 +20,13 @@ TS_D_MODEL=128
 
 # 训练配置
 NUM_TRAIN_EPOCHS=3
-PER_DEVICE_TRAIN_BATCH_SIZE=4
-GRADIENT_ACCUMULATION_STEPS=4
+PER_DEVICE_TRAIN_BATCH_SIZE=1  # 减小batch size以节省显存
+GRADIENT_ACCUMULATION_STEPS=16  # 增加累积步数以保持有效batch size
 LEARNING_RATE=1e-3
 WARMUP_RATIO=0.03
 
 deepspeed --num_gpus=4 src/train_multimodal.py \
-    --deepspeed configs/zero2.json \
+    --deepspeed configs/zero3.json \
     --model_name_or_path ${MODEL_PATH} \
     --data_path ${DATA_PATH} \
     --output_dir ${OUTPUT_DIR} \

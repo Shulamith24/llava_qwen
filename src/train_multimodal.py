@@ -283,10 +283,14 @@ def train():
             rank0_print("  - 解冻PatchTST编码器")
             model.get_ts_encoder().unfreeze()
         
-        # 打印可训练参数
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in model.parameters())
-        rank0_print(f"  - 可训练参数: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
+        # 打印可训练参数（需要处理ZeRO-3分片情况）
+        if training_args.local_rank == 0 or training_args.local_rank == -1:
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in model.parameters())
+            if total_params > 0:
+                rank0_print(f"  - 可训练参数: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
+            else:
+                rank0_print(f"  - 可训练参数: (使用ZeRO-3，参数已分片)")
     
     # ============ QLoRA预处理 ============
     if training_args.bits in [4, 8]:
