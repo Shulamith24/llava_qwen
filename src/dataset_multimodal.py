@@ -13,6 +13,31 @@ import transformers
 from .constants import IGNORE_INDEX, DEFAULT_TS_TOKEN
 
 
+def normalize_timeseries(ts_tensor: torch.Tensor, eps: float = 1e-5):
+    """
+    对时间序列进行Instance Normalization，并提取尺度信息
+    
+    Args:
+        ts_tensor: [n_vars, seq_len] 时间序列张量
+        eps: 防止除零的小常数
+        
+    Returns:
+        normalized: [n_vars, seq_len] 归一化后的时间序列
+        scale_stats: [n_vars, 2] 每个变量的(mean, std)
+    """
+    # 计算每个变量的统计量
+    means = ts_tensor.mean(dim=-1)  # [n_vars]
+    stds = ts_tensor.std(dim=-1).clamp(min=eps)  # [n_vars]
+    
+    # 归一化: (x - mean) / std
+    normalized = (ts_tensor - means.unsqueeze(-1)) / stds.unsqueeze(-1)
+    
+    # 组合尺度信息: [n_vars, 2]
+    scale_stats = torch.stack([means, stds], dim=-1)
+    
+    return normalized, scale_stats
+
+
 
 # 正则表达式：匹配<ts></ts>成对标签
 
@@ -110,7 +135,7 @@ def preprocess_multimodal_qwen(
     # Mask user部分
     labels[:prefix_len] = IGNORE_INDEX
     
-    # 8. 转换时间序列为tensor
+    # 8. 转换时间序列为tensor并进行归一化
     # timeseries: [[var1], [var2], ...] -> [n_vars, seq_len]
     ts_tensor = torch.tensor(timeseries, dtype=torch.float32)
     
@@ -125,10 +150,14 @@ def preprocess_multimodal_qwen(
             # 截断
             ts_tensor = ts_tensor[:, :context_window]
     
+    # 9. 归一化时间序列并提取尺度信息
+    ts_normalized, scale_stats = normalize_timeseries(ts_tensor)
+    
     return dict(
         input_ids=input_ids,
         labels=labels,
-        timeseries=ts_tensor  # [n_vars, seq_len]
+        timeseries=ts_normalized,  # [n_vars, seq_len] 归一化后的时间序列
+        scale_stats=scale_stats     # [n_vars, 2] 每个变量的(mean, std)
     )
 
 
@@ -200,7 +229,8 @@ class MultimodalDataset(Dataset):
             return dict(
                 input_ids=processed["input_ids"],
                 labels=processed["labels"],
-                timeseries=processed["timeseries"]
+                timeseries=processed["timeseries"],
+                scale_stats=processed["scale_stats"]
             )
         
         except Exception as e:
@@ -224,19 +254,21 @@ class DataCollatorForMultimodalDataset:
         整理batch
         
         Args:
-            instances: List of dicts, 每个dict包含 {input_ids, labels, timeseries}
+            instances: List of dicts, 每个dict包含 {input_ids, labels, timeseries, scale_stats}
             
         Returns:
             batch: {
                 input_ids: [batch, seq_len],
                 labels: [batch, seq_len],
                 attention_mask: [batch, seq_len],
-                timeseries: List of [n_vars, seq_len]  # 注意：这里是list而非tensor
+                timeseries: List of [n_vars, seq_len],  # 注意：这里是list而非tensor
+                scale_stats: List of [n_vars, 2]        # 每个变量的(mean, std)
             }
         """
         input_ids = [instance["input_ids"] for instance in instances]
         labels = [instance["labels"] for instance in instances]
         timeseries = [instance["timeseries"] for instance in instances]
+        scale_stats = [instance["scale_stats"] for instance in instances]
         
         # Padding文本部分
         input_ids = torch.nn.utils.rnn.pad_sequence(
@@ -257,14 +289,15 @@ class DataCollatorForMultimodalDataset:
         # TODO: attention_mask的构造，作用？
         attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
         
-        # timeseries保持为list（因为可能变量数不同）
+        # timeseries和scale_stats保持为list（因为可能变量数不同）
         # 模型forward时会逐个处理
         
         batch = dict(
             input_ids=input_ids,
             labels=labels,
             attention_mask=attention_mask,
-            timeseries=timeseries  # List of [n_vars, seq_len]
+            timeseries=timeseries,  # List of [n_vars, seq_len]
+            scale_stats=scale_stats  # List of [n_vars, 2]
         )
         
         return batch

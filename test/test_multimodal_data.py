@@ -184,6 +184,7 @@ def test_model_forward(data_path, model_path, context_window=256):
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['labels'].to(device)
         time_series = [ts.to(device) for ts in batch['timeseries']]
+        scale_stats = [ss.to(device) for ss in batch['scale_stats']]
         
         print(f"\n执行forward...")
         with torch.no_grad():
@@ -191,7 +192,8 @@ def test_model_forward(data_path, model_path, context_window=256):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
-                timeseries=time_series
+                timeseries=time_series,
+                scale_stats=scale_stats
             )
         
         print(f"✓ Forward成功！")

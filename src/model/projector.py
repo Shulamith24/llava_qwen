@@ -59,6 +59,40 @@ class IdentityProjector(nn.Module):
         return x
 
 
+class ScaleEncoder(nn.Module):
+    """
+    尺度编码器
+    
+    将时间序列的尺度信息(mean, std)编码为隐藏向量，
+    作为额外的token注入到LLM中，使模型能够感知原始数据的尺度。
+    
+    Args:
+        output_dim: 输出维度（与LLM hidden_size一致）
+        hidden_dim: 中间隐藏层维度      #这里使用一个超参数
+    """
+    
+    def __init__(self, output_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        
+        self.encoder = nn.Sequential(
+            nn.Linear(2, hidden_dim),  # 输入: (mean, std)
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim),  #从超参数--> llm_hidden_size
+        )
+    
+    def forward(self, scale_stats: torch.Tensor) -> torch.Tensor:
+        """
+        编码尺度信息
+        
+        Args:
+            scale_stats: [n_vars, 2] 或 [2]，每个变量的(mean, std)
+            
+        Returns:
+            scale_embed: [n_vars, output_dim] 或 [output_dim]，尺度嵌入向量
+        """
+        return self.encoder(scale_stats)
+
+
 def build_projector(projector_type: str, input_dim: int, output_dim: int, **kwargs):
     """
     构建投影层

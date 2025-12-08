@@ -13,7 +13,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import Qwen3Config, Qwen3Model, Qwen3ForCausalLM
 
 from .ts_encoder import PatchTSTEncoderWrapper, build_ts_encoder
-from .projector import build_projector
+from .projector import build_projector, ScaleEncoder
 from ..constants import IGNORE_INDEX, DEFAULT_TS_TOKEN
 from .. import constants
 
@@ -50,6 +50,10 @@ class Qwen3TSConfig(Qwen3Config):
         tune_mm_mlp_adapter: bool = False,  # 是否只训练投影层（预训练阶段）
         pretrain_mm_mlp_adapter: Optional[str] = None,  # 预训练投影层权重路径
         
+        # 尺度编码配置
+        use_scale_embedding: bool = True,  # 是否使用尺度嵌入
+        scale_encoder_hidden_dim: int = 64,  # 尺度编码器隐藏层维度
+        
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -74,6 +78,10 @@ class Qwen3TSConfig(Qwen3Config):
         # 训练
         self.tune_mm_mlp_adapter = tune_mm_mlp_adapter
         self.pretrain_mm_mlp_adapter = pretrain_mm_mlp_adapter  #预训练投影层权重路径
+        
+        # 尺度编码
+        self.use_scale_embedding = use_scale_embedding
+        self.scale_encoder_hidden_dim = scale_encoder_hidden_dim
 
 
 class Qwen3TSModel(Qwen3Model):
@@ -107,30 +115,46 @@ class Qwen3TSModel(Qwen3Model):
                 input_dim=config.mm_hidden_size,
                 output_dim=config.hidden_size
             )
+            
+            # 尺度编码器（可选）
+            if getattr(config, 'use_scale_embedding', True):
+                self.scale_encoder = ScaleEncoder(
+                    output_dim=config.hidden_size,
+                    hidden_dim=getattr(config, 'scale_encoder_hidden_dim', 64)
+                )
     
     def get_ts_encoder(self):
         """获取时序编码器"""
         return getattr(self, 'ts_encoder', None)
     
-    def encode_timeseries(self, time_series_list: List[torch.Tensor]) -> List[List[torch.Tensor]]:
+    def encode_timeseries(
+        self, 
+        time_series_list: List[torch.Tensor],
+        scale_stats_list: Optional[List[torch.Tensor]] = None
+    ) -> List[List[torch.Tensor]]:
         """
         编码时间序列（批量，逐样本处理）
         
-        保持变量维度的结构化组织，每个变量的patches独立投影
+        保持变量维度的结构化组织，每个变量的patches独立投影。
+        如果启用尺度嵌入，每个变量的特征前会添加一个尺度token。
         
         Args:
-            time_series_list: List of [n_vars, seq_len]
+            time_series_list: List of [n_vars, seq_len]，归一化后的时间序列
+            scale_stats_list: List of [n_vars, 2]，每个变量的(mean, std)
             
         Returns:
-            features_list: List of (List of [n_patches, hidden_size])
+            features_list: List of (List of [1+n_patches, hidden_size] or [n_patches, hidden_size])
                           外层List长度为batch_size，内层List长度为n_vars
+                          如果启用尺度嵌入，每个变量特征形状为[1+n_patches, hidden_size]
         """
         ts_encoder = self.get_ts_encoder()
         if ts_encoder is None:
             raise ValueError("时序编码器未初始化")
         
+        use_scale = getattr(self, 'scale_encoder', None) is not None and scale_stats_list is not None
+        
         features_list = []
-        for ts in time_series_list:
+        for batch_idx, ts in enumerate(time_series_list):
             # ts: [n_vars, seq_len]
             # 将输入移动到与编码器相同的device和dtype，避免dtype冲突
             ts = ts.to(device=ts_encoder.device, dtype=ts_encoder.dtype)
@@ -138,6 +162,13 @@ class Qwen3TSModel(Qwen3Model):
             ts_features = ts_encoder(ts)
             
             n_vars, n_patches, d_model = ts_features.shape
+            
+            # 获取当前样本的尺度信息
+            if use_scale:
+                cur_scale_stats = scale_stats_list[batch_idx].to(
+                    device=ts_encoder.device, 
+                    dtype=ts_encoder.dtype
+                )  # [n_vars, 2]
             
             # 逐变量投影，保持变量边界
             var_features = []
@@ -147,9 +178,19 @@ class Qwen3TSModel(Qwen3Model):
                 
                 # 投影到Qwen3空间: [n_patches, hidden_size]
                 projected = self.mm_projector(var_patches)
+                
+                # 如果启用尺度嵌入，在前面插入尺度token
+                if use_scale:
+                    # 获取该变量的尺度信息: [2]
+                    var_scale = cur_scale_stats[var_idx]
+                    # 编码为尺度嵌入: [hidden_size]
+                    scale_embed = self.scale_encoder(var_scale)  # [hidden_size]
+                    # 拼接: [1 + n_patches, hidden_size]
+                    projected = torch.cat([scale_embed.unsqueeze(0), projected], dim=0)
+                
                 var_features.append(projected)
             
-            # var_features: List of [n_patches, hidden_size]，长度为n_vars
+            # var_features: List of [1+n_patches, hidden_size] or [n_patches, hidden_size]
             features_list.append(var_features)
         
         return features_list
@@ -221,7 +262,8 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[List[torch.FloatTensor]],
         labels: Optional[torch.LongTensor],
-        timeseries: Optional[List[torch.Tensor]]
+        timeseries: Optional[List[torch.Tensor]],
+        scale_stats: Optional[List[torch.Tensor]] = None
     ):
         """
         准备多模态输入
@@ -234,6 +276,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
             past_key_values: KV cache
             labels: [batch, seq_len]
             timeseries: List of [n_vars, seq_len]，长度为batch_size
+            scale_stats: List of [n_vars, 2]，每个变量的(mean, std)
             
         Returns:
             None, attention_mask, past_key_values, inputs_embeds, labels
@@ -252,9 +295,9 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
                 )
             return input_ids, attention_mask, past_key_values, None, labels
         
-        # 编码时间序列
-        ts_features_list = self.model.encode_timeseries(timeseries)
-        # ts_features_list: List of (List of [n_patches, hidden_size])
+        # 编码时间序列（传入scale_stats用于尺度嵌入）
+        ts_features_list = self.model.encode_timeseries(timeseries, scale_stats)
+        # ts_features_list: List of (List of [1+n_patches, hidden_size] or [n_patches, hidden_size])
         #                   外层List长度为batch_size，内层List长度为n_vars
         
         # 构建融合的embedding序列
@@ -262,7 +305,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
         new_labels = [] if labels is not None else None
         
         for batch_idx, cur_input_ids in enumerate(input_ids):
-            # 当前样本的时序特征: List of [n_patches, hidden_size]，长度为n_vars
+            # 当前样本的时序特征: List of [1+n_patches, hidden_size] or [n_patches, hidden_size]，长度为n_vars
             cur_ts_var_features = ts_features_list[batch_idx]
             n_vars = len(cur_ts_var_features)
             
@@ -416,6 +459,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         timeseries: Optional[List[torch.Tensor]] = None,  # 关键参数
+        scale_stats: Optional[List[torch.Tensor]] = None,  # 尺度信息
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         """
@@ -432,6 +476,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
             output_attentions: 是否输出注意力权重
             output_hidden_states: 是否输出隐藏状态
             timeseries: List of [n_vars, seq_len]，时间序列数据
+            scale_stats: List of [n_vars, 2]，尺度信息(mean, std)
             return_dict: 是否返回字典
             
         Returns:
@@ -445,7 +490,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
 
         input_ids, attention_mask, past_key_values, inputs_embeds, labels = \
             self.prepare_inputs_labels_for_multimodal(
-                input_ids, attention_mask, past_key_values, labels, timeseries
+                input_ids, attention_mask, past_key_values, labels, timeseries, scale_stats
             )
         
         # Qwen3 forward
@@ -531,6 +576,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
             "use_cache": kwargs.get("use_cache"),
             "attention_mask": attention_mask,
             "timeseries": kwargs.get("timeseries", None),
+            "scale_stats": kwargs.get("scale_stats", None),
         })
         
         return model_inputs
