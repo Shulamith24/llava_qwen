@@ -14,8 +14,14 @@ from transformers import Qwen3Config, Qwen3Model, Qwen3ForCausalLM
 
 from .ts_encoder import PatchTSTEncoderWrapper, build_ts_encoder
 from .projector import build_projector, ScaleEncoder
-from ..constants import IGNORE_INDEX, DEFAULT_TS_TOKEN
-from .. import constants
+
+# 兼容两种导入方式：作为包导入 vs 直接运行脚本
+try:
+    from ..constants import IGNORE_INDEX, DEFAULT_TS_TOKEN
+    from .. import constants
+except ImportError:
+    from constants import IGNORE_INDEX, DEFAULT_TS_TOKEN
+    import constants
 
 
 class Qwen3TSConfig(Qwen3Config):
@@ -238,7 +244,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
     
     #加载预训练投影层权重
     def load_pretrain_projector(self, projector_path: str):
-        """加载预训练投影层权重"""
+        """加载预训练投影层权重（包括scale_encoder）"""
         if not os.path.exists(projector_path):
             print(f"警告：投影层权重不存在: {projector_path}")
             return
@@ -255,6 +261,11 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
         
         self.model.mm_projector.load_state_dict(projector_weights, strict=False)
         print("投影层权重加载成功")
+        
+        # 加载scale_encoder权重（如果存在）
+        if 'scale_encoder' in weights and hasattr(self.model, 'scale_encoder'):
+            self.model.scale_encoder.load_state_dict(weights['scale_encoder'], strict=False)
+            print("尺度编码器权重加载成功")
     
     def prepare_inputs_labels_for_multimodal(
         self,
@@ -279,7 +290,8 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
             scale_stats: List of [n_vars, 2]，每个变量的(mean, std)
             
         Returns:
-            None, attention_mask, past_key_values, inputs_embeds, labels
+            None, position_ids, attention_mask, past_key_values, inputs_embeds, labels
+            注意：position_ids会在token扩展后重新生成
         """
         ts_encoder = self.get_ts_encoder()
         
@@ -293,7 +305,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
                     dtype=attention_mask.dtype,
                     device=attention_mask.device
                 )
-            return input_ids, attention_mask, past_key_values, None, labels
+            return input_ids, None, attention_mask, past_key_values, None, labels
         
         # 编码时间序列（传入scale_stats用于尺度嵌入）
         ts_features_list = self.model.encode_timeseries(timeseries, scale_stats)
@@ -445,7 +457,14 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
                     device=attention_mask.device
                 )
         
-        return None, attention_mask, past_key_values, new_input_embeds, new_labels
+        # 生成新的position_ids（关键修复：token扩展后需要重新生成）
+        batch_size, new_seq_len = new_input_embeds.shape[:2]
+        new_position_ids = torch.arange(
+            new_seq_len, 
+            device=new_input_embeds.device
+        ).unsqueeze(0).expand(batch_size, -1)
+        
+        return None, new_position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
     
     def forward(
         self,
@@ -487,8 +506,7 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
         # 准备多模态输入
-
-        input_ids, attention_mask, past_key_values, inputs_embeds, labels = \
+        input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels = \
             self.prepare_inputs_labels_for_multimodal(
                 input_ids, attention_mask, past_key_values, labels, timeseries, scale_stats
             )

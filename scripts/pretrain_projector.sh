@@ -10,7 +10,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3  # 根据GPU数量调整
 MODEL_PATH="Qwen/Qwen3-8B"  # Qwen3模型路径
 DATA_PATH="data/pretrain.jsonl"  # 预训练数据路径
 OUTPUT_DIR="outputs/pretrain_projector"  # 输出目录
-PATCHTST_CKPT="PatchTST_supervised/checkpoints/checkpoint.pth"  # PatchTST权重
+PATCHTST_CKPT=None # PatchTST权重
 
 # PatchTST配置
 CONTEXT_WINDOW=256
@@ -32,7 +32,7 @@ deepspeed --num_gpus=4 src/train_multimodal.py \
     --output_dir ${OUTPUT_DIR} \
     --mm_ts_tower patchtst \
     --patchtst_checkpoint ${PATCHTST_CKPT} \
-    --freeze_patchtst True \
+    --freeze_patchtst False \
     --context_window ${CONTEXT_WINDOW} \
     --patch_len ${PATCH_LEN} \
     --stride ${STRIDE} \

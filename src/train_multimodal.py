@@ -272,6 +272,12 @@ def train():
         for p in model.model.mm_projector.parameters():
             p.requires_grad = True
         
+        # 解冻scale_encoder（如果存在）
+        if hasattr(model.model, 'scale_encoder'):
+            for p in model.model.scale_encoder.parameters():
+                p.requires_grad = True
+            rank0_print("  - 解冻尺度编码器")
+        
         # 解冻PatchTST（如果需要）
         if not model_args.freeze_patchtst:
             rank0_print("  - 解冻PatchTST编码器")
@@ -419,14 +425,24 @@ def train():
     rank0_print(f"\n保存模型到: {training_args.output_dir}")
     
     if model_args.tune_mm_mlp_adapter:
-        # 预训练阶段：只保存投影层
-        rank0_print("  - 保存投影层权重...")
+        # 预训练阶段：保存投影层和尺度编码器
+        rank0_print("  - 保存投影层和尺度编码器权重...")
         if training_args.local_rank == 0 or training_args.local_rank == -1:
-            projector_weights = {
-                k: v.cpu() for k, v in model.model.mm_projector.state_dict().items()
+            save_dict = {
+                'mm_projector': {
+                    k: v.cpu() for k, v in model.model.mm_projector.state_dict().items()
+                }
             }
+            
+            # 保存scale_encoder（如果存在）
+            if hasattr(model.model, 'scale_encoder'):
+                save_dict['scale_encoder'] = {
+                    k: v.cpu() for k, v in model.model.scale_encoder.state_dict().items()
+                }
+                rank0_print(f"  ✓ 尺度编码器权重已保存")
+            
             torch.save(
-                {'mm_projector': projector_weights},
+                save_dict,
                 os.path.join(training_args.output_dir, 'mm_projector.bin')
             )
             rank0_print(f"  ✓ 投影层权重已保存")
