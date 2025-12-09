@@ -89,31 +89,16 @@ class SimplePatchTSTEncoder(nn.Module):
         # 5. 最终归一化
         self.norm = nn.LayerNorm(d_model)
     
-    def _ensure_float32(self):
-        """确保编码器权重为 float32（应对 bf16 加载的情况）"""
-        if self.patch_projection.weight.dtype != torch.float32:
-            self.patch_projection.float()
-            self.pos_embed.data = self.pos_embed.data.float()
-            self.transformer.float()
-            self.norm.float()
-    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         前向传播
         
         Args:
             x: [n_vars, seq_len] 单个样本的时间序列
-               输入可以是任意精度，编码全程强制使用 float32
             
         Returns:
             features: [n_vars, n_patches, d_model] 时序特征 (float32)
         """
-        # 确保编码器权重为 float32
-        self._ensure_float32()
-        
-        # 确保输入为 float32
-        x = x.float()
-        
         # 处理输入维度
         if x.dim() == 3:
             assert x.size(0) == 1, "只支持单样本编码"
@@ -122,26 +107,29 @@ class SimplePatchTSTEncoder(nn.Module):
         n_vars, seq_len = x.shape
         assert seq_len == self.context_window, \
             f"输入序列长度 {seq_len} 与 context_window {self.context_window} 不匹配"
-        
-        # === 1. Patching ===
-        x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
-        # x: [n_vars, n_patches, patch_len]
-        
-        # === 2. Patch 投影 ===
-        x = self.patch_projection(x)
-        # x: [n_vars, n_patches, d_model], float32
-        
-        # === 3. 位置编码 ===
-        x = x + self.pos_embed
-        
-        # === 4. Dropout ===
-        x = self.dropout(x)
-        
-        # === 5. Transformer 层 ===
-        x = self.transformer(x)
-        
-        # === 6. 最终归一化 ===
-        x = self.norm(x)
+            
+        # 强制使用 float32 进行计算，避免 bf16 下的精度问题
+        # 使用 autocast 确保算子在 float32 下运行，而不是手动转换权重
+        with torch.autocast(device_type=self.device.type, dtype=torch.float32):
+            # === 1. Patching ===
+            x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+            # x: [n_vars, n_patches, patch_len]
+            
+            # === 2. Patch 投影 ===
+            x = self.patch_projection(x)
+            # x: [n_vars, n_patches, d_model]
+            
+            # === 3. 位置编码 ===
+            x = x + self.pos_embed
+            
+            # === 4. Dropout ===
+            x = self.dropout(x)
+            
+            # === 5. Transformer 层 ===
+            x = self.transformer(x)
+            
+            # === 6. 最终归一化 ===
+            x = self.norm(x)
         
         return x
     
@@ -185,12 +173,11 @@ class SimplePatchTSTEncoder(nn.Module):
     
     @property
     def dtype(self):
-        # 始终返回 float32，确保输入转换正确
-        return torch.float32
+        return self.patch_projection.weight.dtype
     
     @property
     def dummy_feature(self):
-        return torch.zeros(1, self.d_model, device=self.device, dtype=torch.float32)
+        return torch.zeros(1, self.d_model, device=self.device, dtype=self.dtype)
     
     def freeze(self):
         self.requires_grad_(False)

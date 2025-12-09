@@ -144,10 +144,6 @@ class Qwen3TSModel(Qwen3Model):
         保持变量维度的结构化组织，每个变量的patches独立投影。
         如果启用尺度嵌入，每个变量的特征前会添加一个尺度token。
         
-        精度策略：
-        - 时序编码全程使用 float32，确保数值稳定
-        - 投影前转换为 LLM 的计算精度（bf16/fp16）
-        
         Args:
             time_series_list: List of [n_vars, seq_len]，归一化后的时间序列
             scale_stats_list: List of [n_vars, 2]，每个变量的(mean, std)
@@ -163,29 +159,20 @@ class Qwen3TSModel(Qwen3Model):
         
         use_scale = getattr(self, 'scale_encoder', None) is not None and scale_stats_list is not None
         
-        # 获取 LLM 的计算精度
-        llm_dtype = self.embed_tokens.weight.dtype
-        
         features_list = []
         for batch_idx, ts in enumerate(time_series_list):
             # ts: [n_vars, seq_len]
-            # 保持 float32 进行编码，确保数值稳定
-            ts = ts.to(device=ts_encoder.device, dtype=torch.float32)
-            
-            # 编码（全程 float32）
+            # 将输入移动到与编码器相同的device
+            ts = ts.to(device=ts_encoder.device)
+            # 编码为 [n_vars, n_patches, d_model]
             ts_features = ts_encoder(ts)
-            # ts_features: [n_vars, n_patches, d_model], float32
             
             n_vars, n_patches, d_model = ts_features.shape
-            
-            # 转换为 LLM 精度后再投影
-            ts_features = ts_features.to(llm_dtype)
             
             # 获取当前样本的尺度信息
             if use_scale:
                 cur_scale_stats = scale_stats_list[batch_idx].to(
-                    device=ts_encoder.device, 
-                    dtype=llm_dtype
+                    device=ts_encoder.device
                 )  # [n_vars, 2]
             
             # 逐变量投影，保持变量边界
