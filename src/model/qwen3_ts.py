@@ -163,7 +163,8 @@ class Qwen3TSModel(Qwen3Model):
         for batch_idx, ts in enumerate(time_series_list):
             # ts: [n_vars, seq_len]
             # 将输入移动到与编码器相同的device
-            ts = ts.to(device=ts_encoder.device)
+            device = next(ts_encoder.parameters()).device
+            ts = ts.to(device=device)
             # 编码为 [n_vars, n_patches, d_model]
             ts_features = ts_encoder(ts)
             
@@ -172,7 +173,7 @@ class Qwen3TSModel(Qwen3Model):
             # 获取当前样本的尺度信息
             if use_scale:
                 cur_scale_stats = scale_stats_list[batch_idx].to(
-                    device=ts_encoder.device
+                    device=device
                 )  # [n_vars, 2]
             
             # 逐变量投影，保持变量边界
