@@ -65,6 +65,9 @@ class SimplePatchTSTEncoder(nn.Module):
         
         # === 核心组件 ===
         
+        # 1. Patch 投影层
+        self.patch_projection = nn.Linear(patch_len, d_model)
+        
         # 2. 位置编码 (Sinusoidal - Fixed & Stable)
         # 使用固定正弦位置编码，无需训练，数值稳定性极高
         pe = torch.zeros(self.n_patches, d_model)
@@ -114,7 +117,7 @@ class SimplePatchTSTEncoder(nn.Module):
             
         # 强制使用 float32 进行计算，避免 bf16 下的精度问题
         # 使用 autocast 确保算子在 float32 下运行，而不是手动转换权重
-        with torch.autocast(device_type=self.device.type, dtype=torch.float32):
+        with torch.autocast(device_type=x.device.type, dtype=torch.float32):
             # === 1. Patching ===
             x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
             # x: [n_vars, n_patches, patch_len]
@@ -174,7 +177,7 @@ class SimplePatchTSTEncoder(nn.Module):
     
     @property
     def device(self):
-        return self.patch_projection.weight.device
+        return next(self.parameters()).device
     
     @property
     def dtype(self):
