@@ -89,21 +89,30 @@ class SimplePatchTSTEncoder(nn.Module):
         # 5. 最终归一化
         self.norm = nn.LayerNorm(d_model)
     
+    def _ensure_float32(self):
+        """确保编码器权重为 float32（应对 bf16 加载的情况）"""
+        if self.patch_projection.weight.dtype != torch.float32:
+            self.patch_projection.float()
+            self.pos_embed.data = self.pos_embed.data.float()
+            self.transformer.float()
+            self.norm.float()
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         前向传播
         
         Args:
             x: [n_vars, seq_len] 单个样本的时间序列
-               输入应为 float32，编码全程保持 float32
+               输入可以是任意精度，编码全程强制使用 float32
             
         Returns:
             features: [n_vars, n_patches, d_model] 时序特征 (float32)
         """
+        # 确保编码器权重为 float32
+        self._ensure_float32()
+        
         # 确保输入为 float32
-        original_dtype = x.dtype
-        if x.dtype != torch.float32:
-            x = x.float()
+        x = x.float()
         
         # 处理输入维度
         if x.dim() == 3:
@@ -118,9 +127,9 @@ class SimplePatchTSTEncoder(nn.Module):
         x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
         # x: [n_vars, n_patches, patch_len]
         
-        # === 2. Patch 投影（确保权重也是 float32）===
+        # === 2. Patch 投影 ===
         x = self.patch_projection(x)
-        # x: [n_vars, n_patches, d_model]
+        # x: [n_vars, n_patches, d_model], float32
         
         # === 3. 位置编码 ===
         x = x + self.pos_embed

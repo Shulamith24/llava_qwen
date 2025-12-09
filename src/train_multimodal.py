@@ -254,6 +254,12 @@ def train():
     )
     model.config.use_cache = False
     
+    # 确保时序编码器保持 float32（即使模型以 bf16 加载）
+    ts_encoder = model.get_ts_encoder()
+    if ts_encoder is not None:
+        ts_encoder.float()
+        rank0_print("  - 时序编码器已设置为 float32")
+    
     rank0_print("✓ 多模态模型加载完成")
     rank0_print(f"  - 时序编码器: {model_args.mm_ts_tower}")
     rank0_print(f"  - 投影层类型: {model_args.mm_projector_type}")
