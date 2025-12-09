@@ -1,49 +1,153 @@
 """
-时序编码器包装类
-包装官方PatchTST编码器，提供统一的接口和权重加载功能
+时序编码器
+基于 PatchTST 思想的精简实现，专门针对 bfloat16 优化数值稳定性
+
+关键设计：
+- 使用 float32 进行注意力计算，避免 bfloat16 溢出
+- 使用较小的初始化值
+- 添加数值稳定性保护
 """
 
-import os
-import sys
 import torch
 import torch.nn as nn
-from typing import Optional, Dict, Any
-
-# 添加PatchTST路径
-current_dir = os.path.dirname(os.path.abspath(__file__))
-patchtst_path = os.path.join(current_dir, '..', 'PatchTST_supervised')
-if patchtst_path not in sys.path:
-    sys.path.insert(0, patchtst_path)
-
-from layers.PatchTST_backbone import PatchTST_backbone
+import torch.nn.functional as F
+from typing import Optional
+import math
 
 
-class PatchTSTEncoderWrapper(nn.Module):
+class StableMultiheadAttention(nn.Module):
     """
-    PatchTST编码器包装类
+    数值稳定的多头注意力
     
-    基于官方PatchTST_backbone，提取backbone的特征而非预测输出
+    关键：在 bfloat16 下，先转为 float32 计算 softmax，再转回 bfloat16
+    """
     
-    **关键设计**：
-    - TSTiEncoder的backbone（W_P, positional encoding, Transformer）不依赖c_in
-    - 只有RevIN和预测head依赖c_in
-    - 我们跳过这两部分，因此可以使用固定的编码器处理任意n_vars的输入
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+        super().__init__()
+        assert d_model % n_heads == 0, f"d_model {d_model} 必须能被 n_heads {n_heads} 整除"
+        
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.scale = self.head_dim ** -0.5
+        
+        # QKV 投影
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=True)
+        self.out_proj = nn.Linear(d_model, d_model, bias=True)
+        self.dropout = nn.Dropout(dropout)
+        
+        # 初始化：使用较小的方差
+        self._init_weights()
     
-    提供统一的接口，支持：
-    - 预训练权重加载
-    - 灵活的冻结/解冻控制
-    - 兼容LLaVA架构的属性
+    def _init_weights(self):
+        # Xavier 初始化，但使用较小的 gain
+        nn.init.xavier_uniform_(self.qkv.weight, gain=0.5)
+        nn.init.zeros_(self.qkv.bias)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.5)
+        nn.init.zeros_(self.out_proj.bias)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [batch, seq_len, d_model]
+        Returns:
+            output: [batch, seq_len, d_model]
+        """
+        batch_size, seq_len, _ = x.shape
+        original_dtype = x.dtype
+        
+        # QKV 投影
+        qkv = self.qkv(x)  # [batch, seq_len, 3 * d_model]
+        qkv = qkv.reshape(batch_size, seq_len, 3, self.n_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, batch, n_heads, seq_len, head_dim]
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        # === 关键：使用 float32 计算 attention ===
+        q = q.float()
+        k = k.float()
+        v_float = v.float()
+        
+        # 缩放点积注意力
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        
+        # 数值稳定性：减去最大值
+        attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True).values
+        
+        # Softmax（float32）
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # 应用注意力
+        output = torch.matmul(attn_weights, v_float)
+        
+        # 转回原始 dtype
+        output = output.to(original_dtype)
+        
+        # 重塑并投影
+        output = output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, self.d_model)
+        output = self.out_proj(output)
+        
+        return output
+
+
+class StableTransformerEncoderLayer(nn.Module):
+    """
+    数值稳定的 Transformer 编码器层
+    """
+    
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
+        super().__init__()
+        
+        self.self_attn = StableMultiheadAttention(d_model, n_heads, dropout)
+        
+        # FFN
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        
+        # LayerNorm
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        # 初始化
+        self._init_weights()
+    
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.linear1.weight, gain=0.5)
+        nn.init.zeros_(self.linear1.bias)
+        nn.init.xavier_uniform_(self.linear2.weight, gain=0.5)
+        nn.init.zeros_(self.linear2.bias)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Self-attention + residual
+        attn_out = self.self_attn(x)
+        x = x + self.dropout1(attn_out)
+        x = self.norm1(x)
+        
+        # FFN + residual
+        ffn_out = self.linear2(F.gelu(self.linear1(x)))
+        x = x + self.dropout2(ffn_out)
+        x = self.norm2(x)
+        
+        return x
+
+
+class SimplePatchTSTEncoder(nn.Module):
+    """
+    精简版 PatchTST 时序编码器（数值稳定版）
+    
+    将时间序列分割成 patches，经过 Transformer 编码后输出特征。
     
     Args:
         context_window: 输入序列长度
-        patch_len: patch长度
-        stride: patch步长
-        d_model: 模型维度
-        n_layers: Transformer层数
+        patch_len: patch 长度
+        stride: patch 步长
+        d_model: Transformer 模型维度
+        n_layers: Transformer 层数
         n_heads: 注意力头数
         d_ff: 前馈网络维度
-        dropout: dropout率
-        **kwargs: 其他PatchTST参数
+        dropout: dropout 率
     """
     
     def __init__(
@@ -68,171 +172,152 @@ class PatchTSTEncoderWrapper(nn.Module):
         self.n_layers = n_layers
         self.n_heads = n_heads
         self.d_ff = d_ff
-        self.dropout = dropout
+        self.dropout_rate = dropout
         
-        # 计算patch数量
-        self.patch_num = int((context_window - patch_len) / stride + 1)
+        # 计算 patch 数量
+        self.n_patches = int((context_window - patch_len) / stride + 1)
         
-        # 兼容LLaVA架构的属性
+        # 兼容属性
         self.is_loaded = False
-        self.hidden_size = d_model  # 每个patch的特征维度
+        self.hidden_size = d_model
         
-        # 创建backbone（使用c_in=1作为dummy，因为backbone不依赖c_in）
-        # 注意：我们不使用RevIN和预测head，所以c_in的值不重要
-        self.backbone = PatchTST_backbone(
-            c_in=1,  # dummy值，backbone不依赖它
-            context_window=context_window,
-            target_window=0,  # 不需要预测
-            patch_len=patch_len,
-            stride=stride,
-            d_model=d_model,
-            n_layers=n_layers,
-            n_heads=n_heads,
-            d_ff=d_ff,
-            dropout=dropout,
-            attn_dropout=dropout,
-            head_dropout=0,
-            individual=False,
-            revin=False,  # 不使用RevIN
-            affine=False,
-            subtract_last=False,
-            pretrain_head=False,
-            head_type='flatten',
-            **kwargs
-        )
+        # === 核心组件 ===
+        
+        # 1. Patch 投影层
+        self.patch_projection = nn.Linear(patch_len, d_model)
+        
+        # 2. 位置编码（较小的初始值）
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.n_patches, d_model))
+        nn.init.trunc_normal_(self.pos_embed, std=0.01)  # 较小的 std
+        
+        # 3. Dropout
+        self.dropout = nn.Dropout(dropout)
+        
+        # 4. Transformer 层
+        self.layers = nn.ModuleList([
+            StableTransformerEncoderLayer(d_model, n_heads, d_ff, dropout)
+            for _ in range(n_layers)
+        ])
+        
+        # 5. 最终归一化
+        self.norm = nn.LayerNorm(d_model)
+        
+        # 初始化 patch projection
+        nn.init.xavier_uniform_(self.patch_projection.weight, gain=0.5)
+        if self.patch_projection.bias is not None:
+            nn.init.zeros_(self.patch_projection.bias)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        前向传播（单样本）
-        
-        直接使用backbone的TSTiEncoder，跳过RevIN和head
+        前向传播
         
         Args:
-            x: [n_vars, seq_len] 单个样本的时间序列
+            x: [n_vars, seq_len] 单个样本的时间序列（已归一化）
             
         Returns:
-            features: [n_vars, patch_num, d_model] 时序特征
+            features: [n_vars, n_patches, d_model] 时序特征
         """
-        # 确保输入是2D: [n_vars, seq_len]
+        # 处理输入维度
         if x.dim() == 3:
-            assert x.size(0) == 1, "Wrapper只支持单样本编码"
+            assert x.size(0) == 1, "只支持单样本编码"
             x = x.squeeze(0)
         
         n_vars, seq_len = x.shape
         assert seq_len == self.context_window, \
-            f"输入序列长度{seq_len}与context_window{self.context_window}不匹配"
+            f"输入序列长度 {seq_len} 与 context_window {self.context_window} 不匹配"
         
-        # 添加batch维度: [1, n_vars, seq_len]
-        z = x.unsqueeze(0)
+        # === 1. Patching ===
+        x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+        # x: [n_vars, n_patches, patch_len]
         
-        # === 手动实现patching，然后调用backbone.backbone（跳过RevIN和head）===
+        # === 2. Patch 投影 ===
+        x = self.patch_projection(x)
+        # x: [n_vars, n_patches, d_model]       
+        # === 3. 位置编码 ===
+        x = x + self.pos_embed
         
-        # Patching（直接使用官方实现的逻辑）
-        # 注意：不需要padding_patch，因为我们的context_window是固定的
-        z = z.unfold(dimension=-1, size=self.patch_len, step=self.stride)  # [bs, n_vars, patch_num, patch_len]
-        z = z.permute(0, 1, 3, 2)  # [bs, n_vars, patch_len, patch_num]
+        # === 4. Dropout ===
+        x = self.dropout(x)
         
-        # 调用TSTiEncoder（backbone.backbone）
-        # 输入: [bs, n_vars, patch_len, patch_num]
-        # 输出: [bs, n_vars, d_model, patch_num]
-        z = self.backbone.backbone(z)
+        # === 5. Transformer 层 ===
+        for layer in self.layers:
+            x = layer(x)
         
-        # 转换为 [bs, n_vars, patch_num, d_model]
-        z = z.permute(0, 1, 3, 2)
+        # === 6. 最终归一化 ===
+        x = self.norm(x)
         
-        # 移除batch维度
-        z = z.squeeze(0)  # [n_vars, patch_num, d_model]
-        
-        return z
+        return x
     
     def load_checkpoint(self, checkpoint_path: str):
-        """
-        加载预训练权重
-        
-        Args:
-            checkpoint_path: checkpoint文件路径
-        """
-        if not os.path.exists(checkpoint_path):
-            print(f"警告：checkpoint文件不存在: {checkpoint_path}")
+        """加载预训练权重（可选）"""
+        if checkpoint_path is None:
             return
         
-        print(f"从 {checkpoint_path} 加载PatchTST权重...")
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        import os
+        if not os.path.exists(checkpoint_path):
+            print(f"警告：checkpoint 不存在: {checkpoint_path}")
+            return
         
-        # 提取模型权重
-        if 'model' in checkpoint:
-            state_dict = checkpoint['model']
-        elif 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-        else:
-            state_dict = checkpoint
-        
-        # 只加载backbone部分的权重（跳过RevIN和head）
-        model_dict = self.backbone.state_dict()
-        pretrained_dict = {}
-        
-        for k, v in state_dict.items():
-            # 只加载backbone相关的权重，跳过revin_layer和head
-            if 'revin_layer' not in k and 'head' not in k:
-                if k in model_dict:
-                    pretrained_dict[k] = v
-        
-        model_dict.update(pretrained_dict)
-        self.backbone.load_state_dict(model_dict, strict=False)
-        print(f"成功加载 {len(pretrained_dict)}/{len([k for k in state_dict.keys() if 'revin_layer' not in k and 'head' not in k])} 个backbone参数")
-        
-        self.is_loaded = True
+        print(f"尝试加载权重: {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            if 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            elif 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            else:
+                state_dict = checkpoint
+            
+            # 尝试兼容加载
+            loaded = 0
+            model_dict = self.state_dict()
+            for k, v in state_dict.items():
+                if k in model_dict and model_dict[k].shape == v.shape:
+                    model_dict[k] = v
+                    loaded += 1
+            
+            self.load_state_dict(model_dict, strict=False)
+            print(f"加载了 {loaded} 个参数")
+            self.is_loaded = True
+        except Exception as e:
+            print(f"加载失败: {e}")
     
     @property
     def device(self):
-        """获取设备"""
-        return next(self.backbone.parameters()).device
+        return self.patch_projection.weight.device
     
     @property
     def dtype(self):
-        """获取数据类型"""
-        return next(self.backbone.parameters()).dtype
+        return self.patch_projection.weight.dtype
     
     @property
     def dummy_feature(self):
-        """返回dummy特征（用于非多模态样本）"""
         return torch.zeros(1, self.d_model, device=self.device, dtype=self.dtype)
     
     def freeze(self):
-        """冻结所有参数"""
         self.requires_grad_(False)
-        print("已冻结PatchTST编码器")
+        print("已冻结时序编码器")
     
     def unfreeze(self):
-        """解冻所有参数"""
         self.requires_grad_(True)
-        print("已解冻PatchTST编码器")
+        print("已解冻时序编码器")
+
+
+# 兼容别名
+PatchTSTEncoderWrapper = SimplePatchTSTEncoder
 
 
 def build_ts_encoder(
     checkpoint_path: Optional[str] = None,
     freeze: bool = True,
     **config
-) -> PatchTSTEncoderWrapper:
-    """
-    构建时序编码器
+) -> SimplePatchTSTEncoder:
+    """构建时序编码器"""
+    encoder = SimplePatchTSTEncoder(**config)
     
-    Args:
-        checkpoint_path: 预训练权重路径
-        freeze: 是否冻结权重
-        **config: 编码器配置参数
-        
-    Returns:
-        encoder: 时序编码器实例
-    """
-    # 创建编码器
-    encoder = PatchTSTEncoderWrapper(**config)
-    
-    # 加载权重
     if checkpoint_path is not None:
         encoder.load_checkpoint(checkpoint_path)
     
-    # 冻结参数
     if freeze:
         encoder.freeze()
     
