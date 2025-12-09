@@ -1,143 +1,24 @@
 """
 时序编码器
-基于 PatchTST 思想的精简实现，专门针对 bfloat16 优化数值稳定性
+基于 PatchTST 思想的精简实现
 
 关键设计：
-- 使用 float32 进行注意力计算，避免 bfloat16 溢出
-- 使用较小的初始化值
-- 添加数值稳定性保护
+- 整个编码器在 float32 下运行，避免 bf16 精度问题
+- 使用标准 PyTorch 组件
+- 输出在传入投影层前再转换精度
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional
-import math
-
-
-class StableMultiheadAttention(nn.Module):
-    """
-    数值稳定的多头注意力
-    
-    关键：在 bfloat16 下，先转为 float32 计算 softmax，再转回 bfloat16
-    """
-    
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
-        super().__init__()
-        assert d_model % n_heads == 0, f"d_model {d_model} 必须能被 n_heads {n_heads} 整除"
-        
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.scale = self.head_dim ** -0.5
-        
-        # QKV 投影
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=True)
-        self.out_proj = nn.Linear(d_model, d_model, bias=True)
-        self.dropout = nn.Dropout(dropout)
-        
-        # 初始化：使用较小的方差
-        self._init_weights()
-    
-    def _init_weights(self):
-        # Xavier 初始化，但使用较小的 gain
-        nn.init.xavier_uniform_(self.qkv.weight, gain=0.5)
-        nn.init.zeros_(self.qkv.bias)
-        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.5)
-        nn.init.zeros_(self.out_proj.bias)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [batch, seq_len, d_model]
-        Returns:
-            output: [batch, seq_len, d_model]
-        """
-        batch_size, seq_len, _ = x.shape
-        original_dtype = x.dtype
-        
-        # QKV 投影
-        qkv = self.qkv(x)  # [batch, seq_len, 3 * d_model]
-        qkv = qkv.reshape(batch_size, seq_len, 3, self.n_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, batch, n_heads, seq_len, head_dim]
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        # === 关键：使用 float32 计算 attention ===
-        q = q.float()
-        k = k.float()
-        v_float = v.float()
-        
-        # 缩放点积注意力
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        
-        # 数值稳定性：减去最大值
-        attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True).values
-        
-        # Softmax（float32）
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        # 应用注意力
-        output = torch.matmul(attn_weights, v_float)
-        
-        # 转回原始 dtype
-        output = output.to(original_dtype)
-        
-        # 重塑并投影
-        output = output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, self.d_model)
-        output = self.out_proj(output)
-        
-        return output
-
-
-class StableTransformerEncoderLayer(nn.Module):
-    """
-    数值稳定的 Transformer 编码器层
-    """
-    
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
-        super().__init__()
-        
-        self.self_attn = StableMultiheadAttention(d_model, n_heads, dropout)
-        
-        # FFN
-        self.linear1 = nn.Linear(d_model, d_ff)
-        self.linear2 = nn.Linear(d_ff, d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        
-        # LayerNorm
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        
-        # 初始化
-        self._init_weights()
-    
-    def _init_weights(self):
-        nn.init.xavier_uniform_(self.linear1.weight, gain=0.5)
-        nn.init.zeros_(self.linear1.bias)
-        nn.init.xavier_uniform_(self.linear2.weight, gain=0.5)
-        nn.init.zeros_(self.linear2.bias)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Self-attention + residual
-        attn_out = self.self_attn(x)
-        x = x + self.dropout1(attn_out)
-        x = self.norm1(x)
-        
-        # FFN + residual
-        ffn_out = self.linear2(F.gelu(self.linear1(x)))
-        x = x + self.dropout2(ffn_out)
-        x = self.norm2(x)
-        
-        return x
 
 
 class SimplePatchTSTEncoder(nn.Module):
     """
-    精简版 PatchTST 时序编码器（数值稳定版）
+    精简版 PatchTST 时序编码器
     
     将时间序列分割成 patches，经过 Transformer 编码后输出特征。
+    整个编码过程在 float32 下进行，确保数值稳定性。
     
     Args:
         context_window: 输入序列长度
@@ -186,37 +67,44 @@ class SimplePatchTSTEncoder(nn.Module):
         # 1. Patch 投影层
         self.patch_projection = nn.Linear(patch_len, d_model)
         
-        # 2. 位置编码（较小的初始值）
+        # 2. 位置编码
         self.pos_embed = nn.Parameter(torch.zeros(1, self.n_patches, d_model))
-        nn.init.trunc_normal_(self.pos_embed, std=0.01)  # 较小的 std
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)  # 标准初始化
         
         # 3. Dropout
         self.dropout = nn.Dropout(dropout)
         
-        # 4. Transformer 层
-        self.layers = nn.ModuleList([
-            StableTransformerEncoderLayer(d_model, n_heads, d_ff, dropout)
-            for _ in range(n_layers)
-        ])
+        # 4. Transformer 编码器层（使用 PyTorch 原生组件）
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True  # Pre-LN 更稳定
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
         # 5. 最终归一化
         self.norm = nn.LayerNorm(d_model)
-        
-        # 初始化 patch projection
-        nn.init.xavier_uniform_(self.patch_projection.weight, gain=0.5)
-        if self.patch_projection.bias is not None:
-            nn.init.zeros_(self.patch_projection.bias)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         前向传播
         
         Args:
-            x: [n_vars, seq_len] 单个样本的时间序列（已归一化）
+            x: [n_vars, seq_len] 单个样本的时间序列
+               输入应为 float32，编码全程保持 float32
             
         Returns:
-            features: [n_vars, n_patches, d_model] 时序特征
+            features: [n_vars, n_patches, d_model] 时序特征 (float32)
         """
+        # 确保输入为 float32
+        original_dtype = x.dtype
+        if x.dtype != torch.float32:
+            x = x.float()
+        
         # 处理输入维度
         if x.dim() == 3:
             assert x.size(0) == 1, "只支持单样本编码"
@@ -230,9 +118,10 @@ class SimplePatchTSTEncoder(nn.Module):
         x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
         # x: [n_vars, n_patches, patch_len]
         
-        # === 2. Patch 投影 ===
+        # === 2. Patch 投影（确保权重也是 float32）===
         x = self.patch_projection(x)
-        # x: [n_vars, n_patches, d_model]       
+        # x: [n_vars, n_patches, d_model]
+        
         # === 3. 位置编码 ===
         x = x + self.pos_embed
         
@@ -240,8 +129,7 @@ class SimplePatchTSTEncoder(nn.Module):
         x = self.dropout(x)
         
         # === 5. Transformer 层 ===
-        for layer in self.layers:
-            x = layer(x)
+        x = self.transformer(x)
         
         # === 6. 最终归一化 ===
         x = self.norm(x)
@@ -288,11 +176,12 @@ class SimplePatchTSTEncoder(nn.Module):
     
     @property
     def dtype(self):
-        return self.patch_projection.weight.dtype
+        # 始终返回 float32，确保输入转换正确
+        return torch.float32
     
     @property
     def dummy_feature(self):
-        return torch.zeros(1, self.d_model, device=self.device, dtype=self.dtype)
+        return torch.zeros(1, self.d_model, device=self.device, dtype=torch.float32)
     
     def freeze(self):
         self.requires_grad_(False)
