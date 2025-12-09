@@ -10,6 +10,7 @@
 
 import torch
 import torch.nn as nn
+import math
 from typing import Optional
 
 
@@ -64,12 +65,15 @@ class SimplePatchTSTEncoder(nn.Module):
         
         # === 核心组件 ===
         
-        # 1. Patch 投影层
-        self.patch_projection = nn.Linear(patch_len, d_model)
-        
-        # 2. 位置编码
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.n_patches, d_model))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)  # 标准初始化
+        # 2. 位置编码 (Sinusoidal - Fixed & Stable)
+        # 使用固定正弦位置编码，无需训练，数值稳定性极高
+        pe = torch.zeros(self.n_patches, d_model)
+        position = torch.arange(0, self.n_patches, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        # 注册为 buffer (不更新，随模型保存)
+        self.register_buffer('pos_embed', pe.unsqueeze(0))
         
         # 3. Dropout
         self.dropout = nn.Dropout(dropout)
@@ -120,6 +124,7 @@ class SimplePatchTSTEncoder(nn.Module):
             # x: [n_vars, n_patches, d_model]
             
             # === 3. 位置编码 ===
+            # pos_embed is now a buffer [1, n_patches, d_model]
             x = x + self.pos_embed
             
             # === 4. Dropout ===

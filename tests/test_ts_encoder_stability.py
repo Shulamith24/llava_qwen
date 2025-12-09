@@ -79,12 +79,17 @@ def test_encoder_stability():
         loss = out.mean()
         loss.backward()
         
-        if encoder.pos_embed.grad is None:
-             print("FAILED: pos_embed.grad is None")
-        elif torch.isnan(encoder.pos_embed.grad).any():
-             print("FAILED: pos_embed.grad contains NaN")
+        # Check if pos_embed is a buffer (no grad)
+        if encoder.pos_embed.requires_grad:
+             print("FAILED: pos_embed should not require grad (should be buffer)")
         else:
-             print("PASSED: Gradients are valid")
+             print("PASSED: pos_embed is fixed buffer")
+             
+        # Check if gradients flow to projection
+        if encoder.patch_projection.weight.grad is None:
+             print("FAILED: patch_projection.weight.grad is None")
+        else:
+             print("PASSED: Gradients flow to projection")
              
     except Exception as e:
         print(f"FAILED: {e}")
