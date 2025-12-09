@@ -1,17 +1,16 @@
 #!/bin/bash
 
-# 预训练阶段：只训练投影层 (双卡数据并行版本)
+# 预训练阶段：只训练投影层 (双卡版本)
 # 使用方法: bash scripts/pretrain_projector_multi.sh
-# 适用于两张显卡并行训练，加快训练速度
 
 # 设置环境变量
 export CUDA_VISIBLE_DEVICES=0,1
 
 # 训练参数
-MODEL_PATH="Qwen/Qwen3-4B"  # Qwen3模型路径
-DATA_PATH="/root/data1/datasets/ChatTS/align_256/train.jsonl"  # 预训练数据路径
-OUTPUT_DIR="outputs/pretrain_projector_multi"  # 输出目录
-PATCHTST_CKPT=None # PatchTST权重
+MODEL_PATH="Qwen/Qwen3-4B"
+DATA_PATH="/root/data1/datasets/ChatTS/align_256/train.jsonl"
+OUTPUT_DIR="outputs/pretrain_projector_multi"
+PATCHTST_CKPT=None
 
 # PatchTST配置
 CONTEXT_WINDOW=256
@@ -19,22 +18,23 @@ PATCH_LEN=16
 STRIDE=8
 TS_D_MODEL=128
 
-# 训练配置
+# 训练配置 (双卡优化)
 NUM_TRAIN_EPOCHS=3
 PER_DEVICE_TRAIN_BATCH_SIZE=4
-GRADIENT_ACCUMULATION_STEPS=16  # 双卡，累积步数减半以保持总batch size不变 (4*16*2 = 128)
+# Global Batch Size = 4 * 16 * 2 = 128 (与单卡 4 * 32 * 1 = 128 保持一致)
+GRADIENT_ACCUMULATION_STEPS=16
 LEARNING_RATE=1e-3
 WARMUP_RATIO=0.03
 
 # 双卡训练，使用 deepspeed
-deepspeed --num_gpus=2 src/train_multimodal.py \
-    --deepspeed configs/zero2.json \
+deepspeed src/train_multimodal.py \
+    --deepspeed scripts/zero2.json \
     --model_name_or_path ${MODEL_PATH} \
     --data_path ${DATA_PATH} \
     --output_dir ${OUTPUT_DIR} \
     --mm_ts_tower patchtst \
     --patchtst_checkpoint ${PATCHTST_CKPT} \
-    --freeze_patchtst True \
+    --freeze_patchtst False \
     --context_window ${CONTEXT_WINDOW} \
     --patch_len ${PATCH_LEN} \
     --stride ${STRIDE} \

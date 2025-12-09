@@ -3,9 +3,9 @@
 基于 PatchTST 思想的精简实现
 
 关键设计：
-- 整个编码器在 float32 下运行，避免 bf16 精度问题
+- 移除强制 float32，支持 bf16
 - 使用标准 PyTorch 组件
-- 输出在传入投影层前再转换精度
+- 输出类型跟随输入
 """
 
 import torch
@@ -19,7 +19,7 @@ class SimplePatchTSTEncoder(nn.Module):
     精简版 PatchTST 时序编码器
     
     将时间序列分割成 patches，经过 Transformer 编码后输出特征。
-    整个编码过程在 float32 下进行，确保数值稳定性。
+    支持 bf16/fp16/fp32 运行。
     
     Args:
         context_window: 输入序列长度
@@ -104,7 +104,7 @@ class SimplePatchTSTEncoder(nn.Module):
             x: [n_vars, seq_len] 单个样本的时间序列
             
         Returns:
-            features: [n_vars, n_patches, d_model] 时序特征 (float32)
+            features: [n_vars, n_patches, d_model] 时序特征
         """
         # 处理输入维度
         if x.dim() == 3:
@@ -115,29 +115,29 @@ class SimplePatchTSTEncoder(nn.Module):
         assert seq_len == self.context_window, \
             f"输入序列长度 {seq_len} 与 context_window {self.context_window} 不匹配"
             
-        # 强制使用 float32 进行计算，避免 bf16 下的精度问题
-        # 使用 autocast 确保算子在 float32 下运行，而不是手动转换权重
-        with torch.autocast(device_type=x.device.type, dtype=torch.float32):
-            # === 1. Patching ===
-            x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
-            # x: [n_vars, n_patches, patch_len]
-            
-            # === 2. Patch 投影 ===
-            x = self.patch_projection(x)
-            # x: [n_vars, n_patches, d_model]
-            
-            # === 3. 位置编码 ===
-            # pos_embed is now a buffer [1, n_patches, d_model]
-            x = x + self.pos_embed
-            
-            # === 4. Dropout ===
-            x = self.dropout(x)
-            
-            # === 5. Transformer 层 ===
-            x = self.transformer(x)
-            
-            # === 6. 最终归一化 ===
-            x = self.norm(x)
+        # 移除强制 float32，允许 bf16
+        # with torch.autocast(device_type=x.device.type, dtype=torch.float32):
+        
+        # === 1. Patching ===
+        x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+        # x: [n_vars, n_patches, patch_len]
+        
+        # === 2. Patch 投影 ===
+        x = self.patch_projection(x)
+        # x: [n_vars, n_patches, d_model]
+        
+        # === 3. 位置编码 ===
+        # pos_embed is now a buffer [1, n_patches, d_model]
+        x = x + self.pos_embed
+        
+        # === 4. Dropout ===
+        x = self.dropout(x)
+        
+        # === 5. Transformer 层 ===
+        x = self.transformer(x)
+        
+        # === 6. 最终归一化 ===
+        x = self.norm(x)
         
         return x
     
