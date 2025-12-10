@@ -255,22 +255,36 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
         # 提取mm_projector权重
         if 'mm_projector' in weights:
             projector_weights = weights['mm_projector']
+            print(f"  - 找到 mm_projector 权重: {len(projector_weights)} keys")
         else:
+            # 尝试从扁平字典中提取
             projector_weights = {k.replace('mm_projector.', ''): v 
                                 for k, v in weights.items() if 'mm_projector' in k}
+            if len(projector_weights) > 0:
+                print(f"  - 从扁平字典提取 mm_projector 权重: {len(projector_weights)} keys")
         
-        self.model.mm_projector.load_state_dict(projector_weights, strict=False)
-        print("投影层权重加载成功")
+        if len(projector_weights) > 0:
+            msg = self.model.mm_projector.load_state_dict(projector_weights, strict=False)
+            print(f"  ✓ 投影层权重加载成功: {msg}")
+        else:
+            print(f"  ! 警告: 未找到投影层权重")
         
         # 加载scale_encoder权重（如果存在）
-        if 'scale_encoder' in weights and hasattr(self.model, 'scale_encoder'):
-            self.model.scale_encoder.load_state_dict(weights['scale_encoder'], strict=False)
-            print("尺度编码器权重加载成功")
+        if hasattr(self.model, 'scale_encoder'):
+            if 'scale_encoder' in weights:
+                msg = self.model.scale_encoder.load_state_dict(weights['scale_encoder'], strict=False)
+                print(f"  ✓ 尺度编码器权重加载成功: {msg}")
+            else:
+                print(f"  ! 注意: 权重文件中未包含 scale_encoder，但模型已初始化该组件")
 
         # 加载ts_encoder权重（如果存在）
-        if 'ts_encoder' in weights and hasattr(self.model, 'ts_encoder'):
-            self.model.ts_encoder.load_state_dict(weights['ts_encoder'], strict=False)
-            print("时序编码器权重加载成功")
+        if hasattr(self.model, 'ts_encoder'):
+            if 'ts_encoder' in weights:
+                msg = self.model.ts_encoder.load_state_dict(weights['ts_encoder'], strict=False)
+                print(f"  ✓ 时序编码器权重加载成功: {msg}")
+            else:
+                # 如果是冻结的patchtst，可能不需要加载训练好的权重，而是用初始化的
+                print(f"  - 权重文件中未包含 ts_encoder")
     
     def prepare_inputs_labels_for_multimodal(
         self,

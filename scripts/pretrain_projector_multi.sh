@@ -11,6 +11,7 @@ MODEL_PATH="Qwen/Qwen3-4B"
 DATA_PATH="/root/data1/datasets/ChatTS/align_256/train.jsonl"
 OUTPUT_DIR="outputs/pretrain_projector_multi"
 PATCHTST_CKPT=None
+CHECKPOINT_PATH="/mnt/data/qyh/codes/llava_qwen/outputs/pretrain_projector_multi/mm_projector.bin"
 
 # PatchTST配置
 CONTEXT_WINDOW=256

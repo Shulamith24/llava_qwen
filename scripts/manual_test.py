@@ -7,31 +7,40 @@ from src.constants import DEFAULT_TS_TOKEN, TS_TOKEN_INDEX
 
 def test_inference():
     # 1. 配置路径
-    model_path = "Qwen/Qwen3-4B"  # 基础模型路径
-    output_dir = "outputs/pretrain_projector_multi" # 训练输出目录
+    # 如果要使用 checkpoint-2463，请将 model_path 修改为 checkpoint 的绝对路径或相对路径
+    # 例如: model_path = "outputs/pretrain_projector_multi/checkpoint-2463"
+    model_path = "Qwen/Qwen3-4B"  # 或者 checkpoint 路径
+    # 如果 model_path 是 checkpoint 文件夹，projector_path 可以忽略
+    output_dir = "outputs/pretrain_projector_multi" 
     projector_path = os.path.join(output_dir, "mm_projector.bin")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # 2. 加载配置
-    print("Loading config...")
-    config = Qwen3TSConfig.from_pretrained(model_path)
+    # 判断是否加载 checkpoint
+    is_checkpoint = os.path.exists(os.path.join(model_path, "config.json"))
     
-    # 更新配置以匹配训练时的设置
-    config.mm_ts_tower = "patchtst"
-    config.ts_d_model = 128
-    config.ts_n_layers = 3
-    config.ts_n_heads = 16
-    config.ts_d_ff = 256
-    config.patch_len = 16
-    config.stride = 8
-    config.context_window = 256
-    config.mm_projector_type = "mlp2x_gelu"
-    config.use_scale_embedding = True
+    # 2. 加载配置
+    print(f"Loading config from {model_path}...")
+    if is_checkpoint:
+        config = Qwen3TSConfig.from_pretrained(model_path)
+    else:
+        config = Qwen3TSConfig.from_pretrained(model_path)
+        # 只有在加载原始 Qwen 模型时才需要手动设置这些参数
+        # 如果加载 checkpoint，config.json 中已经包含了这些参数
+        config.mm_ts_tower = "patchtst"
+        config.ts_d_model = 128
+        config.ts_n_layers = 3
+        config.ts_n_heads = 16
+        config.ts_d_ff = 256
+        config.patch_len = 16
+        config.stride = 8
+        config.context_window = 256
+        config.mm_projector_type = "mlp2x_gelu"
+        config.use_scale_embedding = True
     
     # 3. 加载模型
-    print("Loading model...")
+    print(f"Loading model from {model_path}...")
     model = Qwen3TSForCausalLM.from_pretrained(
         model_path,
         config=config,
@@ -40,12 +49,15 @@ def test_inference():
     )
     
     # 4. 加载训练好的权重 (Projector + Scale Encoder)
-    # 注意：如果训练时解冻了PatchTST但脚本没保存PatchTST权重，这里加载的将是初始化的PatchTST
-    if os.path.exists(projector_path):
+    # 只有当 model_path 是原始 Qwen 模型时，才需要额外加载 projector 权重
+    # 如果 model_path 是 checkpoint，权重已经包含在模型中了
+    if not is_checkpoint and os.path.exists(projector_path):
         print(f"Loading projector weights from {projector_path}")
         model.load_pretrain_projector(projector_path)
-    else:
+    elif not is_checkpoint:
         print(f"Warning: Projector weights not found at {projector_path}")
+    else:
+        print("Model loaded from checkpoint, skipping separate projector loading.")
 
     # 5. 加载Tokenizer
     print("Loading tokenizer...")

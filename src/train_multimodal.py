@@ -429,34 +429,48 @@ def train():
     rank0_print(f"\n保存模型到: {training_args.output_dir}")
     
     if model_args.tune_mm_mlp_adapter:
-        # 预训练阶段：保存投影层和尺度编码器
-        rank0_print("  - 保存投影层和尺度编码器权重...")
-        if training_args.local_rank == 0 or training_args.local_rank == -1:
-            save_dict = {
-                'mm_projector': {
-                    k: v.cpu() for k, v in model.model.mm_projector.state_dict().items()
-                }
-            }
-            
-            # 保存scale_encoder（如果存在）
-            if hasattr(model.model, 'scale_encoder'):
-                save_dict['scale_encoder'] = {
-                    k: v.cpu() for k, v in model.model.scale_encoder.state_dict().items()
-                }
-                rank0_print(f"  ✓ 尺度编码器权重已保存")
+        # 预训练阶段：保存投影层、尺度编码器和时序编码器
+        rank0_print("  - 保存多模态适配器权重...")
+        
+        # 辅助函数：获取状态字典（支持DeepSpeed ZeRO-3）
+        def get_state_dict_maybe_zero3(module, module_name):
+            if module is None: return None
+            state_dict = module.state_dict()
+            # 使用maybe_zero_3处理参数收集 (需要在所有rank上运行)
+            return {k: maybe_zero_3(v, name=f"{module_name}.{k}").cpu() for k, v in state_dict.items()}
 
-            # 保存ts_encoder（如果解冻）
-            if not model_args.freeze_patchtst:
-                save_dict['ts_encoder'] = {
-                    k: v.cpu() for k, v in model.model.ts_encoder.state_dict().items()
-                }
-                rank0_print(f"  ✓ 时序编码器权重已保存")
+        # 1. 收集投影层权重 (All ranks must participate in gather)
+        projector_weights = get_state_dict_maybe_zero3(model.model.mm_projector, "mm_projector")
+        
+        # 2. 收集尺度编码器权重
+        scale_encoder_weights = None
+        if hasattr(model.model, 'scale_encoder'):
+            scale_encoder_weights = get_state_dict_maybe_zero3(model.model.scale_encoder, "scale_encoder")
             
-            torch.save(
-                save_dict,
-                os.path.join(training_args.output_dir, 'mm_projector.bin')
-            )
-            rank0_print(f"  ✓ 投影层权重已保存")
+        # 3. 收集时序编码器权重（如果解冻）
+        ts_encoder_weights = None
+        if not model_args.freeze_patchtst:
+            ts_encoder_weights = get_state_dict_maybe_zero3(model.model.ts_encoder, "ts_encoder")
+
+        # 4. 保存（仅在主进程）
+        if training_args.local_rank == 0 or training_args.local_rank == -1:
+            save_dict = {}
+            
+            if projector_weights:
+                save_dict['mm_projector'] = projector_weights
+                rank0_print(f"  ✓ 投影层权重已收集")
+                
+            if scale_encoder_weights:
+                save_dict['scale_encoder'] = scale_encoder_weights
+                rank0_print(f"  ✓ 尺度编码器权重已收集")
+                
+            if ts_encoder_weights:
+                save_dict['ts_encoder'] = ts_encoder_weights
+                rank0_print(f"  ✓ 时序编码器权重已收集")
+            
+            output_path = os.path.join(training_args.output_dir, 'mm_projector.bin')
+            torch.save(save_dict, output_path)
+            rank0_print(f"  ✓ 所有权重已保存到: {output_path}")
     
     elif training_args.lora_enable:
         # LoRA微调阶段：保存LoRA权重+投影层
