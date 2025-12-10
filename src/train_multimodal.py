@@ -444,6 +444,13 @@ def train():
                     k: v.cpu() for k, v in model.model.scale_encoder.state_dict().items()
                 }
                 rank0_print(f"  ✓ 尺度编码器权重已保存")
+
+            # 保存ts_encoder（如果解冻）
+            if not model_args.freeze_patchtst:
+                save_dict['ts_encoder'] = {
+                    k: v.cpu() for k, v in model.model.ts_encoder.state_dict().items()
+                }
+                rank0_print(f"  ✓ 时序编码器权重已保存")
             
             torch.save(
                 save_dict,

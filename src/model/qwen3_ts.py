@@ -266,6 +266,11 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
         if 'scale_encoder' in weights and hasattr(self.model, 'scale_encoder'):
             self.model.scale_encoder.load_state_dict(weights['scale_encoder'], strict=False)
             print("尺度编码器权重加载成功")
+
+        # 加载ts_encoder权重（如果存在）
+        if 'ts_encoder' in weights and hasattr(self.model, 'ts_encoder'):
+            self.model.ts_encoder.load_state_dict(weights['ts_encoder'], strict=False)
+            print("时序编码器权重加载成功")
     
     def prepare_inputs_labels_for_multimodal(
         self,
