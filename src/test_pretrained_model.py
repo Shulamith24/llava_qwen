@@ -339,12 +339,15 @@ def run_generation_comparison(
         # Tokenize
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
         
+        # 获取模型dtype并转换时间序列数据
+        model_dtype = next(model.parameters()).dtype
+        
         # 生成
         with torch.no_grad():
             output_ids = model.generate(
                 input_ids,
-                timeseries=[ts_normalized.to(device)],
-                scale_stats=[scale_stats.to(device)],
+                timeseries=[ts_normalized.to(device=device, dtype=model_dtype)],
+                scale_stats=[scale_stats.to(device=device, dtype=model_dtype)],
                 max_new_tokens=max_new_tokens,
                 do_sample=False,  # 使用greedy decoding以便对比
                 use_cache=True,

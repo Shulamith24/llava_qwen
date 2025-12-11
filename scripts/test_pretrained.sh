@@ -9,7 +9,7 @@ export CUDA_VISIBLE_DEVICES=0
 
 # 路径配置
 CHECKPOINT_PATH="/mnt/data/qyh/codes/llava_qwen/outputs/pretrain_projector_multi/checkpoint-2463"
-DATA_PATH="/root/data1/datasets/ChatTS/align_256/train.jsonl"
+DATA_PATH="/mnt/data/qyh/codes/dataset/ChatTS/align_256/train.jsonl"
 
 # 测试参数
 BATCH_SIZE=2
