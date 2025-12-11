@@ -226,9 +226,10 @@ def run_forward_test(model, dataloader, device):
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
             
-            # timeseries和scale_stats是list，需要移动每个tensor
-            timeseries = [ts.to(device) for ts in batch["timeseries"]]
-            scale_stats = [ss.to(device) for ss in batch["scale_stats"]]
+            # timeseries和scale_stats是list，需要移动每个tensor并转换dtype
+            model_dtype = next(model.parameters()).dtype
+            timeseries = [ts.to(device=device, dtype=model_dtype) for ts in batch["timeseries"]]
+            scale_stats = [ss.to(device=device, dtype=model_dtype) for ss in batch["scale_stats"]]
             
             # 前向传播
             outputs = model(
