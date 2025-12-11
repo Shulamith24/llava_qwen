@@ -582,24 +582,41 @@ class Qwen3TSForCausalLM(Qwen3ForCausalLM):
         **kwargs
     ):
         """准备生成阶段的输入"""
-        # KV cache处理
+        # KV cache处理 - 兼容不同版本的past_key_values格式
         if past_key_values is not None:
-            past_length = past_key_values[0][0].shape[2]
-            
-            if input_ids.shape[1] > past_length:
-                remove_prefix_length = past_length
-            else:
-                remove_prefix_length = input_ids.shape[1] - 1
-            
-            input_ids = input_ids[:, remove_prefix_length:]
+            # 检查past_key_values是否有效（不是空的且内部元素不为None）
+            try:
+                if len(past_key_values) > 0 and past_key_values[0] is not None:
+                    # 尝试获取past_length
+                    if isinstance(past_key_values[0], tuple) and past_key_values[0][0] is not None:
+                        past_length = past_key_values[0][0].shape[2]
+                    elif hasattr(past_key_values, 'get_seq_length'):
+                        # 新版本transformers的Cache对象
+                        past_length = past_key_values.get_seq_length()
+                    else:
+                        past_length = 0
+                    
+                    if past_length > 0:
+                        if input_ids.shape[1] > past_length:
+                            remove_prefix_length = past_length
+                        else:
+                            remove_prefix_length = input_ids.shape[1] - 1
+                        
+                        input_ids = input_ids[:, remove_prefix_length:]
+            except (IndexError, AttributeError, TypeError):
+                # past_key_values格式不符合预期，跳过KV cache处理
+                pass
         
         # Position IDs
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1]:]
+            if past_key_values is not None:
+                try:
+                    position_ids = position_ids[:, -input_ids.shape[1]:]
+                except:
+                    pass
         
         # 构建model inputs
         if inputs_embeds is not None and past_key_values is None:
